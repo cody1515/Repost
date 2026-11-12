@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e0f12">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Repost</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon.svg">
+<link rel="apple-touch-icon" href="/icon.svg">
+<style>
+  :root {
+    --bg: #0e0f12; --card: #17191e; --card2: #1e2128; --line: #2a2e37;
+    --text: #eef0f4; --muted: #8b92a1; --accent: #ff3d6e; --accent2: #25d6c4;
+    --ok: #3ddc84; --warn: #ffb547; --err: #ff5a5a; --r: 16px;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  body { padding: env(safe-area-inset-top) 0 calc(78px + env(safe-area-inset-bottom)); }
+  main { max-width: 640px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 26px; margin: 8px 0 16px; letter-spacing: -.02em; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 26px 4px 10px; font-weight: 600; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--r); padding: 16px; margin-bottom: 12px; }
+  .row { display: flex; align-items: center; gap: 10px; }
+  .between { justify-content: space-between; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .small { font-size: 12px; }
+  .grow { flex: 1; min-width: 0; }
+  .trunc { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  button, .btn { appearance: none; border: 0; border-radius: 12px; padding: 12px 16px; font: inherit; font-weight: 600;
+    background: var(--card2); color: var(--text); cursor: pointer; text-decoration: none; display: inline-flex;
+    align-items: center; justify-content: center; gap: 6px; }
+  button:active { transform: scale(.98); }
+  .primary { background: var(--accent); color: #fff; }
+  .ghost { background: transparent; border: 1px solid var(--line); }
+  .danger { color: var(--err); }
+  .sm { padding: 7px 11px; font-size: 13px; border-radius: 10px; }
+  .full { width: 100%; }
+  input, select, textarea { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+    border-radius: 12px; padding: 12px; font: inherit; font-size: 16px; }
+  textarea { min-height: 92px; resize: vertical; }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); border-color: transparent; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 12px 2px 6px; }
+  .stack > * + * { margin-top: 10px; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: var(--r); padding: 14px 12px; }
+  .stat b { display: block; font-size: 24px; letter-spacing: -.02em; }
+  .stat span { color: var(--muted); font-size: 12px; }
+  .status { display: flex; align-items: center; gap: 12px; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 5px #3ddc8422; flex: none; }
+  .dot.paused { background: var(--warn); box-shadow: 0 0 0 5px #ffb54722; }
+  .dot.busy { background: var(--accent2); box-shadow: 0 0 0 5px #25d6c422; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity: .4; } }
+  .switch { position: relative; width: 50px; height: 30px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch span { position: absolute; inset: 0; background: var(--line); border-radius: 30px; transition: .2s; }
+  .switch span::before { content: ""; position: absolute; width: 24px; height: 24px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .2s; }
+  .switch input:checked + span { background: var(--ok); }
+  .switch input:checked + span::before { transform: translateX(20px); }
+  .chip { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+  .c-posted { background: #3ddc8422; color: var(--ok); }
+  .c-queued, .c-partial { background: #25d6c422; color: var(--accent2); }
+  .c-failed { background: #ff5a5a22; color: var(--err); }
+  .src { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; font-size: 12px; font-weight: 800; flex: none; }
+  .src.tiktok { background: #000; color: #fff; border: 1px solid #333; }
+  .src.instagram { background: linear-gradient(135deg, #f58529, #dd2a7b, #8134af); color: #fff; }
+  .item { display: flex; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); }
+  .item:first-child { border-top: 0; padding-top: 0; }
+  .item:last-child { padding-bottom: 0; }
+  .err { color: var(--err); font-size: 12px; margin-top: 4px; word-break: break-word; }
+  .log { font-size: 13px; padding: 6px 0; border-top: 1px solid var(--line); display: flex; gap: 8px; }
+  .log:first-child { border-top: 0; }
+  .log span { min-width: 0; overflow-wrap: anywhere; }
+  .log time { color: var(--muted); flex: none; font-variant-numeric: tabular-nums; }
+  .log.warn { color: var(--warn); } .log.error { color: var(--err); }
+  nav { position: fixed; bottom: 0; left: 0; right: 0; background: #0e0f12ee; backdrop-filter: blur(12px);
+    border-top: 1px solid var(--line); display: flex; padding-bottom: env(safe-area-inset-bottom); z-index: 5; }
+  nav button { flex: 1; background: none; border-radius: 0; padding: 12px 0 14px; flex-direction: column; gap: 3px;
+    color: var(--muted); font-size: 11px; font-weight: 600; }
+  nav button svg { width: 24px; height: 24px; }
+  nav button.on { color: var(--text); }
+  nav button.on svg { color: var(--accent); }
+  .hidden { display: none !important; }
+  #toast { position: fixed; left: 50%; bottom: calc(92px + env(safe-area-inset-bottom)); transform: translateX(-50%);
+    background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 12px; font-weight: 600;
+    opacity: 0; transition: .2s; pointer-events: none; z-index: 10; max-width: 90vw; text-align: center; }
+  #toast.show { opacity: 1; }
+  #toast.bad { background: var(--err); color: #fff; }
+  .login { min-height: 80vh; display: grid; place-items: center; }
+  .login .card { width: 100%; max-width: 360px; padding: 28px 22px; }
+  .seg { display: flex; background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 3px; }
+  .seg label { flex: 1; margin: 0; text-align: center; padding: 9px; border-radius: 9px; cursor: pointer; color: var(--muted); font-weight: 600; font-size: 14px; }
+  .seg input { display: none; }
+  .seg input:checked + label { background: var(--card2); color: var(--text); }
+  .note { background: var(--card2); border-radius: 12px; padding: 12px; font-size: 13px; color: var(--muted); }
+  .note b { color: var(--text); }
+  code { background: var(--bg); padding: 2px 6px; border-radius: 6px; font-size: 12px; word-break: break-all; }
+  .empty { text-align: center; color: var(--muted); padding: 24px 8px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; padding: 4px 2px; }
+  .ok-text { color: var(--ok); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<!-- LOGIN -->
+<div id="loginView" class="login hidden">
+  <form class="card stack" id="loginForm">
+    <div style="text-align:center"><img src="/icon.svg" width="56" height="56" alt=""><h1 style="margin:10px 0 4px">Repost</h1>
+      <div class="muted">Enter your app password</div></div>
+    <input type="password" id="pw" placeholder="Password" autocomplete="current-password" required>
+    <button class="primary full">Log in</button>
+  </form>
+</div>
+
+<main id="app" class="hidden">
+
+  <!-- HOME -->
+  <section id="tab-home">
+    <div class="row between"><h1>Repost</h1><button class="sm ghost" id="refreshBtn">Refresh</button></div>
+
+    <div class="card">
+      <div class="row between">
+        <div class="status"><div class="dot" id="dot"></div>
+          <div><b id="statusText">…</b><div class="muted small" id="statusSub"></div></div></div>
+        <label class="switch" title="Bot on/off"><input type="checkbox" id="runToggle"><span></span></label>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button class="grow ghost sm" id="checkNow">Check now</button>
+        <button class="grow ghost sm" id="postNow">Post next now</button>
+      </div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><b id="sQueued">0</b><span>In queue</span></div>
+      <div class="stat"><b id="sToday">0</b><span>Posted 24h</span></div>
+      <div class="stat"><b id="sTotal">0</b><span>All time</span></div>
+    </div>
+
+    <div id="setupHint" class="card note hidden"></div>
+
+    <h2>Add a video by link</h2>
+    <form class="card stack" id="queueForm">
+      <input id="qUrl" placeholder="Paste a TikTok or Instagram link" inputmode="url" required>
+      <div class="row">
+        <select id="qCreator" class="grow" required></select>
+        <button class="primary">Queue</button>
+      </div>
+    </form>
+
+    <h2>Activity</h2>
+    <div class="card" id="posts"></div>
+
+    <h2>Log</h2>
+    <div class="card" id="events"></div>
+    <div class="row" style="justify-content:center;margin-top:20px"><button class="sm ghost" id="logout">Log out</button></div>
+  </section>
+
+  <!-- CREATORS -->
+  <section id="tab-creators" class="hidden">
+    <div class="row between"><h1>Creators</h1><button class="primary sm" id="addCreatorBtn">+ Add</button></div>
+
+    <form class="card stack hidden" id="creatorForm">
+      <input type="hidden" id="cId">
+      <b id="cFormTitle">Add creator</b>
+      <div>
+        <label style="margin-top:4px">Pull their videos from</label>
+        <div class="seg">
+          <input type="radio" name="cSrc" id="cSrcTT" value="tiktok" checked><label for="cSrcTT">TikTok</label>
+          <input type="radio" name="cSrc" id="cSrcIG" value="instagram"><label for="cSrcIG">Instagram</label>
+        </div>
+      </div>
+      <div><label>TikTok handle</label><input id="cTT" placeholder="@handle" autocapitalize="off" autocorrect="off"></div>
+      <div><label>Instagram handle</label><input id="cIG" placeholder="@handle" autocapitalize="off" autocorrect="off"></div>
+      <div class="muted small">Fill in both if you can. Each app's caption tags them with their handle on that app.</div>
+      <div><label>Name (optional)</label><input id="cName" placeholder="Shows in the app"></div>
+      <div><label>Permission note</label><input id="cPerm" placeholder="e.g. said yes in DMs 11/12"></div>
+      <div class="row"><button type="button" class="ghost grow" id="cCancel">Cancel</button><button class="primary grow">Save</button></div>
+      <div class="muted small">New creators: only videos they post from now on get reposted (unless you change "Backfill" in Settings).</div>
+    </form>
+
+    <div id="creators"></div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section id="tab-settings" class="hidden">
+    <h1>Settings</h1>
+
+    <h2>Caption</h2>
+    <div class="card">
+      <label style="margin-top:0">Caption template</label>
+      <textarea id="caption_template"></textarea>
+      <div class="muted small" style="margin-top:6px"><code>{caption}</code> their caption · <code>{credit}</code> credit tag · <code>{name}</code> · <code>{url}</code> original link</div>
+      <label>Credit format</label>
+      <input id="credit_format" placeholder="@{handle}">
+      <label>Preview</label>
+      <div class="note" id="capPreview" style="white-space:pre-wrap;color:var(--text)"></div>
+    </div>
+
+    <h2>Post to</h2>
+    <div class="card stack">
+      <div class="row between"><span>Instagram Reels</span><label class="switch"><input type="checkbox" id="post_to_instagram"><span></span></label></div>
+      <div class="row between"><span>TikTok</span><label class="switch"><input type="checkbox" id="post_to_tiktok"><span></span></label></div>
+    </div>
+
+    <h2>Timing</h2>
+    <div class="card">
+      <label style="margin-top:0">Check for new videos every (minutes)</label><input type="number" id="check_every_minutes" min="5" inputmode="numeric">
+      <label>Minimum minutes between posts</label><input type="number" id="minutes_between_posts" min="0" inputmode="numeric">
+      <label>How many recent videos to look at per creator</label><input type="number" id="scan_depth" min="1" max="50" inputmode="numeric">
+      <label>Backfill: when adding a creator, also post their last N videos</label><input type="number" id="first_run_backfill" min="0" max="20" inputmode="numeric">
+    </div>
+
+    <h2>Your Instagram</h2>
+    <div class="card">
+      <div class="row between"><b>Status</b><span id="igStatus"></span></div>
+      <label>Instagram account ID</label><input id="ig_user_id" inputmode="numeric" placeholder="1784…">
+      <label>Access token</label><input id="ig_access_token" type="password" placeholder="Paste to set or replace">
+      <details style="margin-top:12px"><summary>Optional: login used to read creators' Instagram pages</summary>
+        <div class="muted small" style="margin:8px 2px">Only needed if you pull from Instagram and checks keep failing. Use a spare account, not your repost page.</div>
+        <label>Username</label><input id="ig_reader_username" autocapitalize="off">
+        <label>sessionid cookie</label><input id="ig_sessionid" type="password" placeholder="Paste to set or replace">
+      </details>
+    </div>
+
+    <h2>Your TikTok</h2>
+    <div class="card stack">
+      <div class="row between"><b>Status</b><span id="ttStatus"></span></div>
+      <a class="btn primary full" id="ttConnect" href="/tiktok/connect">Connect TikTok</a>
+      <div>
+        <label>Posting mode</label>
+        <div class="seg">
+          <input type="radio" name="ttMode" id="ttInbox" value="inbox"><label for="ttInbox">Drafts (inbox)</label>
+          <input type="radio" name="ttMode" id="ttDirect" value="direct"><label for="ttDirect">Post directly</label>
+        </div>
+        <div class="muted small" style="margin-top:8px">Until TikTok approves your developer app, anything posted directly is forced to private. Use <b>Drafts</b> for now: videos land in your TikTok inbox, and the caption is in Activity for you to copy.</div>
+      </div>
+      <div class="muted small">TikTok redirect URI to paste in the TikTok developer portal:<br><code id="cbUrl"></code></div>
+    </div>
+
+    <button class="primary full" id="saveSettings" style="margin-top:18px">Save settings</button>
+  </section>
+</main>
+
+<nav id="nav" class="hidden">
+  <button data-tab="home" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>Home</button>
+  <button data-tab="creators"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-6 7-6s7 2 7 6"/><path d="M17 4a4 4 0 0 1 0 8M22 21c0-3-1.5-5-4-5.7"/></svg>Creators</button>
+  <button data-tab="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>Settings</button>
+</nav>
+
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let S = null, settingsDirty = false;
+
+function toast(msg, bad) {
+  const t = $("#toast"); t.textContent = msg; t.className = "show" + (bad ? " bad" : "");
+  clearTimeout(t._h); t._h = setTimeout(() => t.className = "", 2600);
+}
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  if (r.status === 401 && path !== "/api/login") { showLogin(); throw new Error("login"); }
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || "Something went wrong");
+  return d;
+}
+function ago(ts) {
+  if (!ts) return "";
+  const t = typeof ts === "number" ? ts * 1000 : Date.parse(ts);
+  const s = Math.round((Date.now() - t) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+function until(ts) {
+  const s = Math.round(ts - Date.now() / 1000);
+  if (s <= 0) return "now";
+  if (s < 60) return "in <1m";
+  if (s < 3600) return "in " + Math.ceil(s / 60) + "m";
+  return "in " + Math.round(s / 3600) + "h";
+}
+
+// ---- views ----
+function showLogin() { $("#loginView").classList.remove("hidden"); $("#app").classList.add("hidden"); $("#nav").classList.add("hidden"); }
+function showApp() { $("#loginView").classList.add("hidden"); $("#app").classList.remove("hidden"); $("#nav").classList.remove("hidden"); }
+function tab(name) {
+  for (const t of ["home", "creators", "settings"]) $("#tab-" + t).classList.toggle("hidden", t !== name);
+  document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.tab === name));
+  if (location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
+  window.scrollTo(0, 0);
+}
+document.querySelectorAll("nav button").forEach(b => b.onclick = () => tab(b.dataset.tab));
+
+$("#loginForm").onsubmit = async e => {
+  e.preventDefault();
+  try { await api("/api/login", {password: $("#pw").value}); $("#pw").value = ""; await load(); }
+  catch (err) { toast(err.message, true); }
+};
+$("#logout").onclick = async () => { await api("/api/logout", {}); showLogin(); };
+
+async function load() {
+  try { S = await api("/api/state"); } catch (e) { return; }
+  showApp(); render();
+}
+
+function render() {
+  const st = S.settings, now = S.server_time;
+  // status
+  const paused = st.paused, busy = /Checking|Posting/.test(S.status);
+  $("#dot").className = "dot" + (paused ? " paused" : busy ? " busy" : "");
+  $("#statusText").textContent = paused ? "Paused" : busy ? S.status + "…" : "Running";
+  $("#statusSub").textContent = paused ? "Not checking or posting" :
+    `Next check ${until(S.next_scan_at - now + Date.now()/1000)}` + (S.counts.queued ? ` · next post ${until(S.next_post_at - now + Date.now()/1000)}` : "");
+  $("#runToggle").checked = !paused;
+  $("#sQueued").textContent = S.counts.queued;
+  $("#sToday").textContent = S.counts.last24h;
+  $("#sTotal").textContent = S.counts.posted;
+
+  // setup hints
+  const hints = [];
+  if (!S.creators.length) hints.push("Add the creators you have permission from in <b>Creators</b>.");
+  if (st.post_to_instagram && !(st.ig_user_id && st.ig_access_token)) hints.push("Connect <b>your Instagram</b> in Settings.");
+  if (st.post_to_tiktok && !st.tiktok_connected) hints.push("Connect <b>your TikTok</b> in Settings.");
+  $("#setupHint").innerHTML = hints.length ? "<b>Finish setup</b><br>" + hints.join("<br>") : "";
+  $("#setupHint").classList.toggle("hidden", !hints.length);
+
+  // queue creator select
+  const sel = $("#qCreator"), keep = sel.value;
+  sel.innerHTML = `<option value="">Whose video is it?</option>` + S.creators.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join("");
+  sel.value = keep;
+
+  // posts
+  $("#posts").innerHTML = S.posts.length ? S.posts.map(p => {
+    const label = p.status === "partial" ? "retrying" : p.status;
+    const targets = [p.ig_status === "done" ? "IG ✓" : "", p.tt_status === "done" ? (st.tiktok_mode === "inbox" ? "TT drafts ✓" : "TT ✓") : ""].filter(Boolean).join(" · ");
+    const actions = (p.status === "failed" ? `<button class="sm ghost" data-retry='${esc(JSON.stringify([p.source, p.post_id]))}'>Retry</button>` : "")
+      + (["queued", "partial", "failed"].includes(p.status) ? `<button class="sm ghost" data-skip='${esc(JSON.stringify([p.source, p.post_id]))}'>Skip</button>` : "")
+      + (p.tt_caption && st.tiktok_mode === "inbox" ? `<button class="sm ghost" data-copy="${esc(p.tt_caption)}">Copy TikTok caption</button>` : "");
+    return `<div class="item">
+      <div class="src ${p.source}">${p.source === "tiktok" ? "TT" : "IG"}</div>
+      <div class="grow">
+        <div class="row between"><b class="trunc">${esc(p.creator || "Unknown")}</b><span class="chip c-${p.status}">${label}</span></div>
+        <div class="muted small trunc"><a href="${esc(p.url)}" target="_blank" rel="noopener" style="color:inherit">${esc(p.url.replace(/^https?:\/\/(www\.)?/, ""))}</a></div>
+        <div class="muted small">${ago(p.posted_at || p.found_at)}${targets ? " · " + targets : ""}${p.manual ? " · added by link" : ""}</div>
+        ${p.error && p.status !== "posted" ? `<div class="err">${esc(p.error)}</div>` : ""}
+        ${actions ? `<div class="row" style="margin-top:8px;flex-wrap:wrap">${actions}</div>` : ""}
+      </div></div>`;
+  }).join("") : `<div class="empty">Nothing yet. New videos from your creators show up here.</div>`;
+
+  // events
+  $("#events").innerHTML = S.events.length ? S.events.map(e =>
+    `<div class="log ${e.level}"><time>${ago(e.ts)}</time><span>${esc(e.msg)}</span></div>`).join("") : `<div class="empty">No activity yet</div>`;
+
+  // creators
+  $("#creators").innerHTML = S.creators.length ? S.creators.map(c => `
+    <div class="card"><div class="row">
+      <div class="src ${c.pull_from}">${c.pull_from === "tiktok" ? "TT" : "IG"}</div>
+      <div class="grow">
+        <b class="trunc" style="display:block">${esc(c.name)}</b>
+        <div class="muted small trunc">${c.tiktok ? "TT @" + esc(c.tiktok) : ""}${c.tiktok && c.instagram ? " · " : ""}${c.instagram ? "IG @" + esc(c.instagram) : ""}</div>
+        <div class="muted small">${c.posted} posted${c.permission ? " · " + esc(c.permission) : ""}</div>
+      </div>
+      <label class="switch"><input type="checkbox" data-toggle="${c.id}" ${c.enabled ? "checked" : ""}><span></span></label>
+    </div>
+    <div class="row" style="margin-top:12px"><button class="sm ghost grow" data-edit="${c.id}">Edit</button><button class="sm ghost danger grow" data-del="${c.id}">Remove</button></div>
+    </div>`).join("") : `<div class="card empty">No creators yet. Tap <b>+ Add</b>.</div>`;
+
+  // settings (don't clobber unsaved edits)
+  if (!settingsDirty) fillSettings();
+  $("#igStatus").innerHTML = st.ig_user_id && st.ig_access_token ? `<span class="ok-text">Connected</span>` : `<span class="muted">Not connected</span>`;
+  $("#ig_access_token").placeholder = st.ig_access_token ? "•••••• saved (paste to replace)" : "Paste your access token";
+  $("#ig_sessionid").placeholder = st.ig_sessionid ? "•••••• saved" : "Paste to set";
+  $("#ttStatus").innerHTML = st.tiktok_connected ? `<span class="ok-text">Connected</span>` : `<span class="muted">Not connected</span>`;
+  $("#ttConnect").textContent = st.tiktok_connected ? "Reconnect TikTok" : "Connect TikTok";
+  $("#ttConnect").classList.toggle("hidden", !st.tiktok_app_configured);
+  $("#cbUrl").textContent = S.callback_url;
+}
+
+function fillSettings() {
+  const st = S.settings;
+  for (const k of ["caption_template", "credit_format", "check_every_minutes", "minutes_between_posts", "scan_depth", "first_run_backfill", "ig_user_id", "ig_reader_username"]) $("#" + k).value = st[k];
+  $("#ig_access_token").value = ""; $("#ig_sessionid").value = "";
+  $("#post_to_instagram").checked = st.post_to_instagram;
+  $("#post_to_tiktok").checked = st.post_to_tiktok;
+  (st.tiktok_mode === "direct" ? $("#ttDirect") : $("#ttInbox")).checked = true;
+  preview();
+}
+function preview() {
+  const credit = $("#credit_format").value.replaceAll("{handle}", "creatorhandle");
+  $("#capPreview").textContent = $("#caption_template").value
+    .replaceAll("{caption}", "Their original caption here #fyp").replaceAll("{credit}", credit)
+    .replaceAll("{name}", "Creator Name").replaceAll("{url}", "https://tiktok.com/@creatorhandle/video/123").trim();
+}
+$("#tab-settings").addEventListener("input", () => { settingsDirty = true; preview(); });
+
+$("#saveSettings").onclick = async () => {
+  const body = {
+    caption_template: $("#caption_template").value, credit_format: $("#credit_format").value,
+    check_every_minutes: +$("#check_every_minutes").value, minutes_between_posts: +$("#minutes_between_posts").value,
+    scan_depth: +$("#scan_depth").value, first_run_backfill: +$("#first_run_backfill").value,
+    post_to_instagram: $("#post_to_instagram").checked, post_to_tiktok: $("#post_to_tiktok").checked,
+    ig_user_id: $("#ig_user_id").value, ig_access_token: $("#ig_access_token").value,
+    ig_reader_username: $("#ig_reader_username").value, ig_sessionid: $("#ig_sessionid").value,
+    tiktok_mode: document.querySelector("input[name=ttMode]:checked").value,
+  };
+  try { await api("/api/settings", body); settingsDirty = false; toast("Saved"); await load(); }
+  catch (e) { toast(e.message, true); }
+};
+
+// ---- home actions ----
+$("#runToggle").onchange = async e => {
+  await api("/api/settings", {paused: !e.target.checked});
+  toast(e.target.checked ? "Bot is running" : "Bot paused"); load();
+};
+$("#checkNow").onclick = async () => { await api("/api/check-now", {}); toast("Checking now…"); setTimeout(load, 4000); };
+$("#postNow").onclick = async () => {
+  if (!S.counts.queued) return toast("Nothing in the queue");
+  await api("/api/post-now", {}); toast("Posting the next video…"); setTimeout(load, 4000);
+};
+$("#refreshBtn").onclick = () => load().then(() => toast("Updated"));
+$("#queueForm").onsubmit = async e => {
+  e.preventDefault();
+  try { await api("/api/queue", {url: $("#qUrl").value, creator_id: +$("#qCreator").value}); $("#qUrl").value = ""; toast("Queued"); load(); }
+  catch (err) { toast(err.message, true); }
+};
+$("#posts").onclick = async e => {
+  const b = e.target.closest("button"); if (!b) return;
+  if (b.dataset.copy) { await navigator.clipboard.writeText(b.dataset.copy); return toast("Caption copied"); }
+  const [source, post_id] = JSON.parse(b.dataset.retry || b.dataset.skip);
+  await api(b.dataset.retry ? "/api/posts/retry" : "/api/posts/skip", {source, post_id});
+  toast(b.dataset.retry ? "Will retry" : "Skipped"); load();
+};
+
+// ---- creators ----
+function openCreator(c) {
+  $("#creatorForm").classList.remove("hidden");
+  $("#cFormTitle").textContent = c ? "Edit creator" : "Add creator";
+  $("#cId").value = c?.id || ""; $("#cTT").value = c?.tiktok || ""; $("#cIG").value = c?.instagram || "";
+  $("#cName").value = c?.name || ""; $("#cPerm").value = c?.permission || "";
+  ((c?.pull_from || "tiktok") === "tiktok" ? $("#cSrcTT") : $("#cSrcIG")).checked = true;
+  $("#creatorForm").scrollIntoView({behavior: "smooth"});
+}
+$("#addCreatorBtn").onclick = () => openCreator(null);
+$("#cCancel").onclick = () => $("#creatorForm").classList.add("hidden");
+$("#creatorForm").onsubmit = async e => {
+  e.preventDefault();
+  const id = +$("#cId").value || null, old = S.creators.find(c => c.id === id);
+  try {
+    await api("/api/creators/save", {id, name: $("#cName").value, tiktok: $("#cTT").value, instagram: $("#cIG").value,
+      permission: $("#cPerm").value, pull_from: document.querySelector("input[name=cSrc]:checked").value,
+      enabled: old ? !!old.enabled : true});
+    $("#creatorForm").classList.add("hidden"); toast(id ? "Saved" : "Creator added"); load();
+  } catch (err) { toast(err.message, true); }
+};
+$("#creators").onclick = async e => {
+  const b = e.target.closest("button"); if (!b) return;
+  if (b.dataset.edit) return openCreator(S.creators.find(c => c.id === +b.dataset.edit));
+  if (b.dataset.del) {
+    const c = S.creators.find(c => c.id === +b.dataset.del);
+    if (!confirm(`Remove ${c.name}? Their queued videos won't post.`)) return;
+    await api("/api/creators/delete", {id: c.id}); toast("Removed"); load();
+  }
+};
+$("#creators").onchange = async e => {
+  const t = e.target.dataset.toggle; if (!t) return;
+  const c = S.creators.find(c => c.id === +t);
+  await api("/api/creators/save", {...c, enabled: e.target.checked});
+  toast(e.target.checked ? "Watching " + c.name : "Paused " + c.name); load();
+};
+
+// ---- start ----
+tab((location.hash.slice(1).split("?")[0]) || "home");
+if (!["home","creators","settings"].includes(location.hash.slice(1).split("?")[0])) tab("home");
+load();
+setInterval(() => { if (!document.hidden && !$("#app").classList.contains("hidden")) load(); }, 20000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
+</script>
+</body>
+</html>
