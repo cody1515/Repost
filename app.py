@@ -34,6 +34,14 @@ def public_url():
     return f"http://localhost:{os.environ.get('PORT', '8080')}"
 
 
+def static_file(name):
+    """Find a web file whether it was uploaded inside static/ or at the top level of the repo."""
+    for path in (BASE / "static" / name, BASE / name):
+        if path.exists():
+            return path.read_bytes()
+    raise FileNotFoundError(f"{name} is missing from the repo; upload it next to app.py")
+
+
 def make_session():
     exp = str(int(time.time()) + SESSION_DAYS * 86400)
     return exp + "." + hmac.new(SECRET, exp.encode(), "sha256").hexdigest()
@@ -121,11 +129,11 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/health":
             return self.send(200, {"ok": True})
         if p in ("/", "/index.html"):
-            return self.send(200, (BASE / "static/index.html").read_bytes(), "text/html; charset=utf-8")
+            return self.send(200, static_file("index.html"), "text/html; charset=utf-8")
         if p == "/manifest.json":
-            return self.send(200, (BASE / "static/manifest.json").read_bytes(), "application/manifest+json")
+            return self.send(200, static_file("manifest.json"), "application/manifest+json")
         if p == "/icon.svg":
-            return self.send(200, (BASE / "static/icon.svg").read_bytes(), "image/svg+xml")
+            return self.send(200, static_file("icon.svg"), "image/svg+xml")
         if not self.authed():
             return self.send(401, {"error": "login"}) if p.startswith("/api/") else self.redirect("/")
 
