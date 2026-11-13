@@ -1,4 +1,4 @@
-"""The worker: at each account's posting times, picks a random creator and reposts their newest unposted video."""
+"""The worker: at each account's posting times, picks a random creator and reposts a random video of theirs not yet posted there."""
 import hashlib
 import random
 import re
@@ -279,15 +279,16 @@ class Engine:
             if self.post_video(s, acc, cr[0], row):
                 return True
 
-        # 2) a random creator's newest video that hasn't been reposted yet
-        creators = self.store.q("SELECT * FROM creators WHERE account_id=? AND enabled=1", (acc["id"],))
+        # 2) a random creator, and a random video of theirs that this account hasn't posted yet
+        creators = self.store.q("SELECT c.* FROM creators c JOIN creator_accounts ca ON ca.creator_id=c.id "
+                                "WHERE ca.account_id=? AND c.enabled=1", (acc["id"],))
         if not creators:
             self.store.log("warn", f"{acc['name']}: no creators to pick from ({why} skipped)")
             return False
         random.shuffle(creators)
         tried = 0
         for cr in creators:
-            cand = self.newest_unposted(s, acc, cr)
+            cand = self.random_unposted(s, acc, cr)
             if not cand:
                 continue
             if self.post_video(s, acc, cr, cand):
@@ -298,7 +299,7 @@ class Engine:
         self.store.log("warn", f"{acc['name']}: nothing could be posted for the {why}")
         return False
 
-    def newest_unposted(self, s, acc, cr):
+    def random_unposted(self, s, acc, cr):
         src = cr["pull_from"]
         handle = (cr.get(src) or "").lstrip("@").strip()
         if not handle:
@@ -308,18 +309,15 @@ class Engine:
                 posts = list(fetch_tiktok(handle, s["scan_depth"]))
             else:
                 posts = list(fetch_instagram(make_ig_loader(s), handle, s["scan_depth"]))
-                # pinned posts come first on Instagram; sort by date so "newest" really is newest
-                posts.sort(key=lambda p: p["date"], reverse=True)
         except Exception as e:
             self.store.log("warn", f"Couldn't load @{handle}'s {src}: {short(e)}")
             return None
         done = {(r["source"], r["post_id"]): r for r in self.store.q(
             "SELECT source, post_id, status, attempts FROM reposts WHERE account_id=?", (acc["id"],))}
-        for p in posts:
-            r = done.get((p["source"], p["post_id"]))
-            if r is None or (r["status"] == "failed" and r["attempts"] < MAX_ATTEMPTS):
-                return p
-        return None
+        options = [p for p in posts
+                   if (r := done.get((p["source"], p["post_id"]))) is None
+                   or (r["status"] == "failed" and r["attempts"] < MAX_ATTEMPTS)]
+        return random.choice(options) if options else None
 
     def post_video(self, s, acc, cr, p):
         """p is a fetched post dict or an existing reposts row. Returns True if it posted."""
