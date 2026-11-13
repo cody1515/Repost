@@ -32,9 +32,7 @@ _EMBEDDED = {
 
 
 def static_file(name):
-    for path in (BASE / "static" / name, BASE / name):
-        if path.exists():
-            return path.read_bytes()
+    # Always use the built-in copy so leftover files in the repo can't show an old version
     return base64.b64decode(_EMBEDDED[name])
 
 
@@ -362,4 +360,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
