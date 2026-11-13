@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS reposts(
     status TEXT, manual INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, error TEXT,
     ig_media_id TEXT, created_at TEXT, posted_at TEXT,
     UNIQUE(account_id, source, post_id));
+CREATE TABLE IF NOT EXISTS creator_accounts(
+    creator_id INTEGER, account_id INTEGER, PRIMARY KEY(creator_id, account_id));
 CREATE TABLE IF NOT EXISTS slots(account_id INTEGER, slot TEXT, PRIMARY KEY(account_id, slot));
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS events(
@@ -99,6 +101,10 @@ class Store:
                        "SELECT ?, creator_id, source, post_id, url, 'posted', found_at, posted_at FROM posts WHERE status='posted'",
                        (acc,))
             self.log("info", "Moved your Instagram connection into Accounts. Set its posting times there.")
+        # creators can now repost to several accounts; carry over the single-account links
+        if not self.q("SELECT 1 FROM creator_accounts LIMIT 1"):
+            self.x("INSERT OR IGNORE INTO creator_accounts(creator_id, account_id) "
+                   "SELECT id, account_id FROM creators WHERE account_id IS NOT NULL")
         for k in ("ig_user_id", "ig_access_token", "tiktok_tokens", "tiktok_oauth_state"):
             self.x("DELETE FROM settings WHERE key=?", (k,))
 
@@ -129,6 +135,18 @@ class Store:
         if rows:
             rows[0]["times"] = json.loads(rows[0]["times"] or "[]")
         return rows[0] if rows else None
+
+    def creator_accounts(self):
+        """{creator_id: [account_id, ...]}"""
+        out = {}
+        for r in self.q("SELECT creator_id, account_id FROM creator_accounts ORDER BY account_id"):
+            out.setdefault(r["creator_id"], []).append(r["account_id"])
+        return out
+
+    def set_creator_accounts(self, creator_id, account_ids):
+        self.x("DELETE FROM creator_accounts WHERE creator_id=?", (creator_id,))
+        for a in account_ids:
+            self.x("INSERT OR IGNORE INTO creator_accounts VALUES (?, ?)", (creator_id, a))
 
     # ---- activity log ----
     def log(self, level, msg):
