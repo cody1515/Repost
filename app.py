@@ -93,6 +93,23 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def send_media(self, token):
+        """Temporary, unguessable link so Instagram can fetch a video it couldn't take by direct upload."""
+        path = engine.public.get(token)
+        if not path or not path.exists():
+            return self.send(404, {"error": "not found"})
+        size = path.stat().st_size
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        with open(path, "rb") as f:
+            while chunk := f.read(1 << 20):
+                self.wfile.write(chunk)
+
     def authed(self):
         c = SimpleCookie(self.headers.get("Cookie", ""))
         return "session" in c and valid_session(c["session"].value)
@@ -120,6 +137,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, static_file("manifest.json"), "application/manifest+json")
         if p == "/icon.svg":
             return self.send(200, static_file("icon.svg"), "image/svg+xml")
+        if p.startswith("/media/") and p.endswith(".mp4"):
+            return self.send_media(p[len("/media/"):-4])
         if p == "/api/state":
             if not self.authed():
                 return self.send(401, {"error": "login"})
@@ -362,6 +381,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if not PASSWORD:
         print("WARNING: APP_PASSWORD isn't set, so nobody can log in until you add it.", flush=True)
+    engine.public_base = public_url()
     engine.start()
     port = int(os.environ.get("PORT", "8080"))
     print(f"Repost app running on port {port} ({public_url()})", flush=True)
