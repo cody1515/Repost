@@ -2,6 +2,9 @@
 import hashlib
 import random
 import re
+import secrets
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -146,19 +149,30 @@ def download_instagram(L, shortcode, dest):
 # --------------------------------------------------------------------------- #
 # Instagram (Graph API)
 # --------------------------------------------------------------------------- #
-def post_instagram(s, acc, video, caption):
-    if not (acc["ig_user_id"] and acc["access_token"]):
-        raise RuntimeError("this account isn't connected")
-    v, tok, uid = s["ig_graph_version"], acc["access_token"], acc["ig_user_id"]
-    graph = f"https://graph.facebook.com/{v}"
-    container = check(requests.post(f"{graph}/{uid}/media", data={
-        "media_type": "REELS", "upload_type": "resumable", "caption": caption,
-        "share_to_feed": "true", "access_token": tok}, timeout=60)).json()["id"]
-    size = video.stat().st_size
-    with open(video, "rb") as f:
-        check(requests.post(f"https://rupload.facebook.com/ig-api-upload/{v}/{container}",
-                            headers={"Authorization": f"OAuth {tok}", "offset": "0",
-                                     "file_size": str(size)}, data=f, timeout=900))
+def prepare_video(src, work):
+    """Re-encode to the format Instagram Reels expects (H.264 + AAC MP4, even dimensions, 30fps max).
+    Falls back to the original file if ffmpeg isn't available or fails."""
+    if not shutil.which("ffmpeg"):
+        return src
+    out = work / "ig.mp4"
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
+           "-map", "0:v:0", "-map", "0:a:0?",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-profile:v", "high", "-level", "4.1",
+           "-pix_fmt", "yuv420p", "-vf", "scale='min(1080,trunc(iw/2)*2)':-2,fps=30", "-r", "30",
+           "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+           "-movflags", "+faststart", str(out)]
+    try:
+        subprocess.run(cmd, check=True, timeout=600, capture_output=True)
+        if out.exists() and out.stat().st_size > 0:
+            return out
+    except subprocess.CalledProcessError as e:
+        print("ffmpeg failed:", (e.stderr or b"")[-500:].decode(errors="ignore"), flush=True)
+    except Exception as e:
+        print("ffmpeg failed:", e, flush=True)
+    return src
+
+
+def _wait_and_publish(graph, uid, tok, container):
     for _ in range(90):
         st = check(requests.get(f"{graph}/{container}", params={
             "fields": "status_code,status", "access_token": tok}, timeout=30)).json()
@@ -171,6 +185,36 @@ def post_instagram(s, acc, video, caption):
         raise RuntimeError("Instagram processing timed out")
     return check(requests.post(f"{graph}/{uid}/media_publish", data={
         "creation_id": container, "access_token": tok}, timeout=60)).json()["id"]
+
+
+def post_instagram(s, acc, video, caption, link_for=None):
+    """Upload the file directly; if Instagram's upload server rejects it, give Instagram a
+    temporary private link to the file instead (link_for(path) -> public URL)."""
+    if not (acc["ig_user_id"] and acc["access_token"]):
+        raise RuntimeError("this account isn't connected")
+    v, tok, uid = s["ig_graph_version"], acc["access_token"], acc["ig_user_id"]
+    graph = f"https://graph.facebook.com/{v}"
+    base = {"media_type": "REELS", "caption": caption, "share_to_feed": "true", "access_token": tok}
+
+    try:
+        container = check(requests.post(f"{graph}/{uid}/media", data={**base, "upload_type": "resumable"},
+                                        timeout=60)).json()["id"]
+        size = video.stat().st_size
+        with open(video, "rb") as f:
+            check(requests.post(f"https://rupload.facebook.com/ig-api-upload/{v}/{container}",
+                                headers={"Authorization": f"OAuth {tok}", "offset": "0",
+                                         "file_size": str(size)}, data=f, timeout=900))
+        return _wait_and_publish(graph, uid, tok, container)
+    except Exception as first:
+        url = link_for(video) if link_for else None
+        if not url:
+            raise
+        try:
+            container = check(requests.post(f"{graph}/{uid}/media", data={**base, "video_url": url},
+                                            timeout=60)).json()["id"]
+            return _wait_and_publish(graph, uid, tok, container)
+        except Exception as second:
+            raise RuntimeError(f"direct upload: {short(first)} / link upload: {short(second)}")
 
 
 def discover_accounts(version, user_token):
@@ -223,6 +267,8 @@ class Engine:
         self.tmp.mkdir(parents=True, exist_ok=True)
         self.wake = threading.Event()
         self.pending = []          # account ids queued by "Post now"
+        self.public = {}           # token -> file, served briefly at /media/<token>.mp4 for Instagram to fetch
+        self.public_base = ""      # set by app.py to the app's https address
         self.status = "Starting"
 
     def start(self):
@@ -232,6 +278,13 @@ class Engine:
         if account_id not in self.pending:
             self.pending.append(account_id)
         self.wake.set()
+
+    def link_for(self, path):
+        if not self.public_base.startswith("https://"):
+            return None
+        token = secrets.token_urlsafe(24)
+        self.public[token] = Path(path)
+        return f"{self.public_base}/media/{token}.mp4"
 
     def _loop(self):
         while True:
@@ -332,7 +385,8 @@ class Engine:
                 path, caption = download_tiktok(p["url"], work)
             else:
                 path, caption = download_instagram(make_ig_loader(s), p["post_id"], work)
-            media_id = post_instagram(s, acc, path, build_caption(s, cr, caption, p["url"]))
+            video = prepare_video(path, work)
+            media_id = post_instagram(s, acc, video, build_caption(s, cr, caption, p["url"]), self.link_for)
             self.store.x("UPDATE reposts SET status='posted', posted_at=?, error=NULL, ig_media_id=? WHERE id=?",
                          (now(), media_id, row["id"]))
             self.store.log("info", f"{acc['name']}: posted {cr['name']}'s video")
@@ -344,6 +398,8 @@ class Engine:
             self.store.log("error", f"{acc['name']}: couldn't post {cr['name']}'s video ({short(e)})")
             return False
         finally:
+            for t in [t for t, f in self.public.items() if f.parent == work]:
+                self.public.pop(t, None)
             for f in work.glob("*"):
                 f.unlink(missing_ok=True)
             work.rmdir()
