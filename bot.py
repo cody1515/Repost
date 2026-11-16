@@ -1,5 +1,6 @@
 """The worker: at each account's posting times, picks a random creator and reposts a random video of theirs not yet posted there."""
 import hashlib
+import json
 import random
 import re
 import secrets
@@ -153,6 +154,21 @@ def download_instagram(L, shortcode, dest):
 # --------------------------------------------------------------------------- #
 # Instagram (Graph API)
 # --------------------------------------------------------------------------- #
+def has_video(path):
+    """False for TikTok photo slideshows, which download as audio (sometimes with a cover image)."""
+    if not shutil.which("ffprobe"):
+        return True
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v",
+                              "-show_entries", "stream=codec_name:stream_disposition=attached_pic",
+                              "-of", "json", str(path)], capture_output=True, text=True, timeout=60).stdout
+        streams = json.loads(out or "{}").get("streams", [])
+    except Exception:
+        return True
+    return any(st.get("codec_name") not in ("mjpeg", "png", "bmp", "gif", "webp")
+               and not (st.get("disposition") or {}).get("attached_pic") for st in streams)
+
+
 def prepare_video(src, work):
     """Re-encode to the format Instagram Reels expects (H.264 + AAC MP4, even dimensions, 30fps max).
     Falls back to the original file if ffmpeg isn't available or fails."""
@@ -424,7 +440,7 @@ class Engine:
             if not cr:
                 self.store.x("UPDATE reposts SET status='skipped', error='creator deleted' WHERE id=?", (row["id"],))
                 continue
-            if self.post_video(s, acc, cr[0], row):
+            if self.post_video(s, acc, cr[0], row) is True:
                 return True
 
         # 2) a random creator, and a random video of theirs that this account hasn't posted yet
@@ -436,14 +452,20 @@ class Engine:
         random.shuffle(creators)
         tried = 0
         for cr in creators:
-            cand = self.random_unposted(s, acc, cr)
-            if not cand:
-                continue
-            if self.post_video(s, acc, cr, cand):
+            result = None
+            for _ in range(5):  # photo posts get skipped, so try a few of this creator's videos
+                cand = self.random_unposted(s, acc, cr)
+                if not cand:
+                    break
+                result = self.post_video(s, acc, cr, cand)
+                if result != "skip":
+                    break
+            if result is True:
                 return True
-            tried += 1
-            if tried >= MAX_CREATORS_PER_SLOT:
-                break
+            if result is False:
+                tried += 1
+                if tried >= MAX_CREATORS_PER_SLOT:
+                    break
         self.store.log("warn", f"{acc['name']}: nothing could be posted for the {why}")
         return False
 
@@ -468,7 +490,8 @@ class Engine:
         return random.choice(options) if options else None
 
     def post_video(self, s, acc, cr, p):
-        """p is a fetched post dict or an existing reposts row. Returns True if it posted."""
+        """p is a fetched post dict or an existing reposts row.
+        Returns True if it posted, "skip" if it isn't a video, False if posting failed."""
         self.store.x("INSERT OR IGNORE INTO reposts(account_id, creator_id, source, post_id, url, status, created_at)"
                      " VALUES (?,?,?,?,?,?,?)",
                      (acc["id"], cr["id"], p["source"], p["post_id"], p["url"], "posting", now()))
@@ -480,6 +503,11 @@ class Engine:
                 path, caption = download_tiktok(p["url"], work)
             else:
                 path, caption = download_instagram(make_ig_loader(s), p["post_id"], work)
+            if not has_video(path):
+                self.store.x("UPDATE reposts SET status='skipped', error='photo post, not a video' WHERE id=?",
+                             (row["id"],))
+                self.store.log("info", f"Skipped a photo post from {cr['name']} (not a video)")
+                return "skip"
             video = prepare_video(path, work)
             platform = acc.get("platform") or "instagram"
             text = build_caption(s, cr, caption, p["url"], platform)
