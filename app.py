@@ -211,7 +211,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.redirect("https://www.tiktok.com/v2/auth/authorize/?" + urllib.parse.urlencode({
                 "client_key": os.environ["TIKTOK_CLIENT_KEY"], "response_type": "code",
                 "scope": "user.info.basic,video.upload,video.publish",
-                "redirect_uri": public_url() + "/tiktok/callback", "state": state}))
+                "redirect_uri": public_url() + "/tiktok/callback", "state": state,
+                "disable_auto_auth": 1}))  # always show TikTok's approval screen
         if p == "/tiktok/callback":
             if not self.authed():
                 return self.redirect("/")
