@@ -1,506 +1,166 @@
-"""The worker: at each account's posting times, picks a random creator and reposts a random video of theirs not yet posted there."""
-import hashlib
-import random
-import re
-import secrets
-import shutil
-import subprocess
-import tempfile
+"""SQLite storage: Instagram accounts, creators, reposts, settings, activity log."""
+import json
+import sqlite3
 import threading
-import time
-import traceback
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime, timezone
 
-import os
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS accounts(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT, username TEXT, ig_user_id TEXT, access_token TEXT,
+    times TEXT DEFAULT '[]', enabled INTEGER DEFAULT 1, created_at TEXT);
+CREATE TABLE IF NOT EXISTS creators(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT, pull_from TEXT, tiktok TEXT, instagram TEXT, permission TEXT,
+    enabled INTEGER DEFAULT 1, seeded INTEGER DEFAULT 0, created_at TEXT);
+CREATE TABLE IF NOT EXISTS reposts(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER, creator_id INTEGER, source TEXT, post_id TEXT, url TEXT,
+    status TEXT, manual INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, error TEXT,
+    ig_media_id TEXT, created_at TEXT, posted_at TEXT,
+    UNIQUE(account_id, source, post_id));
+CREATE TABLE IF NOT EXISTS creator_accounts(
+    creator_id INTEGER, account_id INTEGER, PRIMARY KEY(creator_id, account_id));
+CREATE TABLE IF NOT EXISTS slots(account_id INTEGER, slot TEXT, PRIMARY KEY(account_id, slot));
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS events(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, level TEXT, msg TEXT);
+"""
 
-import requests
-
-from store import now
-
-TT_API = "https://open.tiktokapis.com/v2"
-
-CAPTION_LIMIT = 2200
-MAX_ATTEMPTS = 3
-CATCH_UP = timedelta(hours=2)   # if the server was down at a posting time, still post within this window
-MAX_CREATORS_PER_SLOT = 4       # how many creators to try before giving up on a slot
-
-
-def check(resp):
-    if not resp.ok:
-        try:
-            msg = resp.json().get("error", {}).get("message") or resp.text
-        except Exception:
-            msg = resp.text
-        raise RuntimeError(f"HTTP {resp.status_code}: {str(msg)[:300]}")
-    return resp
-
-
-def short(e):
-    s = str(e).strip()
-    return s.splitlines()[-1][:300] if s else e.__class__.__name__
-
-
-def get_tz(name):
-    try:
-        from zoneinfo import ZoneInfo
-        return ZoneInfo(name)
-    except Exception:
-        from datetime import timezone
-        return timezone.utc
-
-
-def valid_time(t):
-    return bool(re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", t or ""))
+DEFAULTS = {
+    "paused": False,
+    "timezone": "America/Los_Angeles",
+    "scan_depth": 15,
+    "caption_template": "{caption}\n\n🎥: {credit}",
+    "credit_format": "@{handle}",
+    "ig_graph_version": "v21.0",
+    # optional login used only to READ creators' Instagram pages
+    "ig_reader_username": "",
+    "ig_sessionid": "",
+    # TikTok posting
+    "tiktok_mode": "inbox",            # inbox = lands in TikTok drafts; direct = posts on its own
+    "tiktok_privacy": "PUBLIC_TO_EVERYONE",
+    "tiktok_oauth_state": "",
+}
+SECRET_KEYS = {"ig_sessionid", "tiktok_oauth_state"}
+DEFAULT_TIMES = ["12:00", "19:00"]
 
 
-def next_post_time(tz_name, times):
-    """Next upcoming posting time (ISO string) for a list of 'HH:MM' times."""
-    tz = get_tz(tz_name)
-    local = datetime.now(tz)
-    best = None
-    for t in times:
-        if not valid_time(t):
-            continue
-        h, m = map(int, t.split(":"))
-        dt = local.replace(hour=h, minute=m, second=0, microsecond=0)
-        if dt <= local:
-            dt += timedelta(days=1)
-        best = dt if best is None or dt < best else best
-    return best.isoformat() if best else None
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-# --------------------------------------------------------------------------- #
-# Links
-# --------------------------------------------------------------------------- #
-def parse_link(url):
-    url = url.strip()
-    host = (re.match(r"https?://([^/]+)", url) or [None, ""])[1].lower()
-    if "tiktok.com" in host:
-        m = re.search(r"/video/(\d+)", url)
-        pid = m.group(1) if m else "link-" + hashlib.sha1(url.encode()).hexdigest()[:12]
-        return "tiktok", pid, url.split("?")[0] if m else url
-    if "instagram.com" in host:
-        m = re.search(r"/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", url)
-        if not m:
-            raise ValueError("That Instagram link doesn't point to a post or reel")
-        return "instagram", m.group(1), f"https://www.instagram.com/reel/{m.group(1)}/"
-    raise ValueError("Paste a TikTok or Instagram link")
+class Store:
+    def __init__(self, path):
+        self.path = str(path)
+        self.lock = threading.RLock()
+        with self.lock:
+            c = self._conn()
+            c.executescript(SCHEMA)
+            c.commit()
+            c.close()
+        self._migrate()
 
+    def _conn(self):
+        c = sqlite3.connect(self.path, timeout=30)
+        c.row_factory = sqlite3.Row
+        return c
 
-# --------------------------------------------------------------------------- #
-# Sources
-# --------------------------------------------------------------------------- #
-def fetch_tiktok(handle, limit):
-    import yt_dlp
-    opts = {"quiet": True, "no_warnings": True, "extract_flat": True,
-            "playlistend": limit, "skip_download": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"https://www.tiktok.com/@{handle}", download=False)
-    for e in (info.get("entries") or [])[:limit]:
-        vid = str(e["id"])
-        yield {"source": "tiktok", "post_id": vid, "url": f"https://www.tiktok.com/@{handle}/video/{vid}"}
-
-
-def download_tiktok(url, dest):
-    import yt_dlp
-    opts = {"quiet": True, "no_warnings": True, "outtmpl": str(dest / "video.%(ext)s"),
-            "format": "best[vcodec^=h264][ext=mp4]/best[ext=mp4]/best"}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-    found = sorted(dest.glob("video.*"))
-    if not found:
-        raise RuntimeError("download finished but the file is missing")
-    return found[0], info.get("description") or ""
-
-
-def make_ig_loader(s):
-    import instaloader
-    L = instaloader.Instaloader(
-        download_pictures=False, download_videos=False, download_video_thumbnails=False,
-        download_geotags=False, download_comments=False, save_metadata=False, quiet=True)
-    if s.get("ig_sessionid") and s.get("ig_reader_username"):
-        L.load_session(s["ig_reader_username"], {"sessionid": s["ig_sessionid"]})
-    return L
-
-
-def fetch_instagram(L, handle, limit):
-    import instaloader
-    profile = instaloader.Profile.from_username(L.context, handle)
-    for i, post in enumerate(profile.get_posts()):
-        if i >= limit:
-            break
-        if post.is_video:
-            yield {"source": "instagram", "post_id": post.shortcode,
-                   "url": f"https://www.instagram.com/reel/{post.shortcode}/",
-                   "pinned": bool(getattr(post, "is_pinned", False)), "date": post.date_utc}
-
-
-def download_instagram(L, shortcode, dest):
-    import instaloader
-    post = instaloader.Post.from_shortcode(L.context, shortcode)
-    if not post.is_video:
-        raise RuntimeError("that Instagram post isn't a video")
-    path = dest / "video.mp4"
-    with requests.get(post.video_url, stream=True, timeout=120) as r:
-        check(r)
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(1 << 20):
-                f.write(chunk)
-    return path, post.caption or ""
-
-
-# --------------------------------------------------------------------------- #
-# Instagram (Graph API)
-# --------------------------------------------------------------------------- #
-def prepare_video(src, work):
-    """Re-encode to the format Instagram Reels expects (H.264 + AAC MP4, even dimensions, 30fps max).
-    Falls back to the original file if ffmpeg isn't available or fails."""
-    if not shutil.which("ffmpeg"):
-        return src
-    out = work / "ig.mp4"
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
-           "-map", "0:v:0", "-map", "0:a:0?",
-           "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-profile:v", "high", "-level", "4.1",
-           "-pix_fmt", "yuv420p", "-vf", "scale='min(1080,trunc(iw/2)*2)':-2,fps=30", "-r", "30",
-           "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
-           "-movflags", "+faststart", str(out)]
-    try:
-        subprocess.run(cmd, check=True, timeout=600, capture_output=True)
-        if out.exists() and out.stat().st_size > 0:
-            return out
-    except subprocess.CalledProcessError as e:
-        print("ffmpeg failed:", (e.stderr or b"")[-500:].decode(errors="ignore"), flush=True)
-    except Exception as e:
-        print("ffmpeg failed:", e, flush=True)
-    return src
-
-
-def _wait_and_publish(graph, uid, tok, container):
-    for _ in range(90):
-        st = check(requests.get(f"{graph}/{container}", params={
-            "fields": "status_code,status", "access_token": tok}, timeout=30)).json()
-        if st.get("status_code") == "FINISHED":
-            break
-        if st.get("status_code") in ("ERROR", "EXPIRED"):
-            raise RuntimeError(f"Instagram couldn't process the video: {st.get('status')}")
-        time.sleep(10)
-    else:
-        raise RuntimeError("Instagram processing timed out")
-    return check(requests.post(f"{graph}/{uid}/media_publish", data={
-        "creation_id": container, "access_token": tok}, timeout=60)).json()["id"]
-
-
-def post_instagram(s, acc, video, caption, link_for=None):
-    """Upload the file directly; if Instagram's upload server rejects it, give Instagram a
-    temporary private link to the file instead (link_for(path) -> public URL)."""
-    if not (acc["ig_user_id"] and acc["access_token"]):
-        raise RuntimeError("this account isn't connected")
-    v, tok, uid = s["ig_graph_version"], acc["access_token"], acc["ig_user_id"]
-    graph = f"https://graph.facebook.com/{v}"
-    base = {"media_type": "REELS", "caption": caption, "share_to_feed": "true", "access_token": tok}
-
-    try:
-        container = check(requests.post(f"{graph}/{uid}/media", data={**base, "upload_type": "resumable"},
-                                        timeout=60)).json()["id"]
-        size = video.stat().st_size
-        with open(video, "rb") as f:
-            check(requests.post(f"https://rupload.facebook.com/ig-api-upload/{v}/{container}",
-                                headers={"Authorization": f"OAuth {tok}", "offset": "0",
-                                         "file_size": str(size)}, data=f, timeout=900))
-        return _wait_and_publish(graph, uid, tok, container)
-    except Exception as first:
-        url = link_for(video) if link_for else None
-        if not url:
-            raise
-        try:
-            container = check(requests.post(f"{graph}/{uid}/media", data={**base, "video_url": url},
-                                            timeout=60)).json()["id"]
-            return _wait_and_publish(graph, uid, tok, container)
-        except Exception as second:
-            raise RuntimeError(f"direct upload: {short(first)} / link upload: {short(second)}")
-
-
-# --------------------------------------------------------------------------- #
-# TikTok (Content Posting API)
-# --------------------------------------------------------------------------- #
-def tiktok_exchange(data):
-    r = requests.post(f"{TT_API}/oauth/token/", data={
-        "client_key": os.environ.get("TIKTOK_CLIENT_KEY", ""),
-        "client_secret": os.environ.get("TIKTOK_CLIENT_SECRET", ""), **data},
-        headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=30)
-    d = r.json() if r.content else {}
-    if "access_token" not in d:
-        raise RuntimeError(f"TikTok login failed: {d.get('error_description') or d.get('error') or r.status_code}")
-    return d
-
-
-def tiktok_display_name(token):
-    r = requests.get(f"{TT_API}/user/info/", params={"fields": "open_id,display_name"},
-                     headers={"Authorization": f"Bearer {token}"}, timeout=30)
-    try:
-        return r.json()["data"]["user"].get("display_name") or ""
-    except Exception:
-        return ""
-
-
-def tiktok_token(store, acc):
-    """Current access token for a TikTok account, refreshing it when it's about to expire."""
-    if not acc.get("refresh_token"):
-        raise RuntimeError("TikTok isn't connected. Tap Reconnect on this account.")
-    if time.time() < (acc.get("token_expires") or 0) - 300:
-        return acc["access_token"]
-    try:
-        d = tiktok_exchange({"grant_type": "refresh_token", "refresh_token": acc["refresh_token"]})
-    except RuntimeError as e:
-        raise RuntimeError(f"{e}. Tap Reconnect on this account.")
-    store.x("UPDATE accounts SET access_token=?, refresh_token=?, token_expires=? WHERE id=?",
-            (d["access_token"], d.get("refresh_token") or acc["refresh_token"],
-             time.time() + d.get("expires_in", 86400), acc["id"]))
-    return d["access_token"]
-
-
-def post_tiktok(store, s, acc, video, caption):
-    h = {"Authorization": f"Bearer {tiktok_token(store, acc)}", "Content-Type": "application/json; charset=UTF-8"}
-    size = video.stat().st_size
-    if size <= 64 * 1024 * 1024:
-        chunk, count = size, 1
-    else:  # TikTok rule: 10MB chunks, the last one absorbs the remainder
-        chunk = 10 * 1024 * 1024
-        count = size // chunk
-    source = {"source": "FILE_UPLOAD", "video_size": size, "chunk_size": chunk, "total_chunk_count": count}
-
-    if s["tiktok_mode"] == "inbox":
-        url, body = f"{TT_API}/post/publish/inbox/video/init/", {"source_info": source}
-    else:
-        info = check(requests.post(f"{TT_API}/post/publish/creator_info/query/", headers=h,
-                                   timeout=30)).json().get("data", {})
-        privacy = s["tiktok_privacy"]
-        options = info.get("privacy_level_options") or []
-        if options and privacy not in options:
-            privacy = "SELF_ONLY" if "SELF_ONLY" in options else options[0]
-        url = f"{TT_API}/post/publish/video/init/"
-        body = {"source_info": source, "post_info": {
-            "title": caption, "privacy_level": privacy,
-            "disable_comment": False, "disable_duet": False, "disable_stitch": False}}
-
-    d = requests.post(url, headers=h, json=body, timeout=60).json()
-    err = d.get("error") or {}
-    if err.get("code") not in (None, "ok"):
-        raise RuntimeError(f"TikTok: {err.get('message') or err.get('code')}")
-    publish_id, upload_url = d["data"]["publish_id"], d["data"]["upload_url"]
-
-    with open(video, "rb") as f:
-        for i in range(count):
-            start = i * chunk
-            end = size - 1 if i == count - 1 else start + chunk - 1
-            f.seek(start)
-            data = f.read(end - start + 1)
-            check(requests.put(upload_url, data=data, timeout=900, headers={
-                "Content-Type": "video/mp4", "Content-Length": str(len(data)),
-                "Content-Range": f"bytes {start}-{end}/{size}"}))
-
-    for _ in range(60):
-        st = requests.post(f"{TT_API}/post/publish/status/fetch/", headers=h,
-                           json={"publish_id": publish_id}, timeout=30).json().get("data", {})
-        if st.get("status") in ("PUBLISH_COMPLETE", "SEND_TO_USER_INBOX"):
-            return publish_id
-        if st.get("status") == "FAILED":
-            raise RuntimeError(f"TikTok rejected it: {st.get('fail_reason')}")
-        time.sleep(10)
-    return publish_id  # still processing on TikTok's side; it finishes on its own
-
-
-def discover_accounts(version, user_token):
-    """List the Instagram accounts reachable with a (long-lived) user token."""
-    r = check(requests.get(f"https://graph.facebook.com/{version}/me/accounts", params={
-        "fields": "name,access_token,instagram_business_account{id,username}",
-        "limit": 100, "access_token": user_token}, timeout=30)).json()
-    out = []
-    for page in r.get("data", []):
-        ig = page.get("instagram_business_account")
-        if ig and page.get("access_token"):
-            out.append({"page": page.get("name"), "ig_user_id": ig["id"],
-                        "username": ig.get("username") or "", "access_token": page["access_token"]})
-    return out
-
-
-def account_username(version, acc):
-    r = check(requests.get(f"https://graph.facebook.com/{version}/{acc['ig_user_id']}", params={
-        "fields": "username", "access_token": acc["access_token"]}, timeout=30)).json()
-    return r.get("username", "")
-
-
-# --------------------------------------------------------------------------- #
-# Captions
-# --------------------------------------------------------------------------- #
-def build_caption(s, creator, original, url, platform="instagram"):
-    """Credit uses the creator's handle on the app you're posting to, if you have it."""
-    handle = (creator.get(platform) or creator.get(creator["pull_from"]) or "").lstrip("@").strip()
-    credit = s["credit_format"].replace("{handle}", handle)
-    tmpl = s["caption_template"]
-
-    def fill(cap):
-        return (tmpl.replace("{caption}", cap).replace("{credit}", credit)
-                .replace("{name}", creator.get("name") or handle).replace("{url}", url).strip())
-
-    original = (original or "").strip()
-    text = fill(original)
-    if len(text) > CAPTION_LIMIT:  # trim their caption, never the credit
-        over = len(text) - CAPTION_LIMIT + 1
-        text = fill(original[:max(0, len(original) - over)] + "…")
-    return text[:CAPTION_LIMIT]
-
-
-# --------------------------------------------------------------------------- #
-# Engine
-# --------------------------------------------------------------------------- #
-class Engine:
-    def __init__(self, store, data_dir):
-        self.store = store
-        self.tmp = Path(data_dir) / "tmp"
-        self.tmp.mkdir(parents=True, exist_ok=True)
-        self.wake = threading.Event()
-        self.pending = []          # account ids queued by "Post now"
-        self.public = {}           # token -> file, served briefly at /media/<token>.mp4 for Instagram to fetch
-        self.public_base = ""      # set by app.py to the app's https address
-        self.status = "Starting"
-
-    def start(self):
-        threading.Thread(target=self._loop, daemon=True).start()
-
-    def post_now(self, account_id):
-        if account_id not in self.pending:
-            self.pending.append(account_id)
-        self.wake.set()
-
-    def link_for(self, path):
-        if not self.public_base.startswith("https://"):
-            return None
-        token = secrets.token_urlsafe(24)
-        self.public[token] = Path(path)
-        return f"{self.public_base}/media/{token}.mp4"
-
-    def _loop(self):
-        while True:
+    def q(self, sql, args=()):
+        with self.lock:
+            c = self._conn()
             try:
-                self.tick()
-            except Exception as e:
-                traceback.print_exc()
-                self.store.log("error", f"Worker error: {short(e)}")
-            self.status = "Paused" if self.store.settings()["paused"] else "Waiting for next posting time"
-            self.wake.wait(30)
-            self.wake.clear()
+                rows = [dict(r) for r in c.execute(sql, args).fetchall()]
+                c.commit()
+                return rows
+            finally:
+                c.close()
 
-    def tick(self):
-        s = self.store.settings()
-        while self.pending:  # "Post now" works even while paused
-            acc = self.store.account(self.pending.pop(0))
-            if acc:
-                self.fire(s, acc, "Post now")
-        if s["paused"]:
-            return
-        local = datetime.now(get_tz(s["timezone"]))
-        for acc in self.store.accounts(enabled_only=True):
-            for t in acc["times"]:
-                if not valid_time(t):
-                    continue
-                h, m = map(int, t.split(":"))
-                slot = local.replace(hour=h, minute=m, second=0, microsecond=0)
-                if not (slot <= local < slot + CATCH_UP):
-                    continue
-                _, new = self.store.x("INSERT OR IGNORE INTO slots VALUES (?, ?)",
-                                      (acc["id"], f"{slot.date()} {t}"))
-                if new:
-                    self.fire(s, acc, f"{t} post")
+    def x(self, sql, args=()):
+        with self.lock:
+            c = self._conn()
+            try:
+                cur = c.execute(sql, args)
+                c.commit()
+                return cur.lastrowid, cur.rowcount
+            finally:
+                c.close()
 
-    # ---- one posting slot ----
-    def fire(self, s, acc, why):
-        self.status = f"Posting to {acc['name']}"
-        # 1) links you added by hand go first
-        for row in self.store.q("SELECT * FROM reposts WHERE account_id=? AND status='queued' ORDER BY id",
-                                (acc["id"],)):
-            cr = self.store.q("SELECT * FROM creators WHERE id=?", (row["creator_id"],))
-            if not cr:
-                self.store.x("UPDATE reposts SET status='skipped', error='creator deleted' WHERE id=?", (row["id"],))
-                continue
-            if self.post_video(s, acc, cr[0], row):
-                return True
+    def _columns(self, table):
+        return {r["name"] for r in self.q(f"PRAGMA table_info({table})")}
 
-        # 2) a random creator, and a random video of theirs that this account hasn't posted yet
-        creators = self.store.q("SELECT c.* FROM creators c JOIN creator_accounts ca ON ca.creator_id=c.id "
-                                "WHERE ca.account_id=? AND c.enabled=1", (acc["id"],))
-        if not creators:
-            self.store.log("warn", f"{acc['name']}: no creators to pick from ({why} skipped)")
-            return False
-        random.shuffle(creators)
-        tried = 0
-        for cr in creators:
-            cand = self.random_unposted(s, acc, cr)
-            if not cand:
-                continue
-            if self.post_video(s, acc, cr, cand):
-                return True
-            tried += 1
-            if tried >= MAX_CREATORS_PER_SLOT:
-                break
-        self.store.log("warn", f"{acc['name']}: nothing could be posted for the {why}")
-        return False
+    def _migrate(self):
+        """Bring data over from older versions of the app."""
+        cols = self._columns("accounts")
+        for col, typ in (("platform", "TEXT DEFAULT 'instagram'"), ("refresh_token", "TEXT"),
+                         ("token_expires", "REAL DEFAULT 0"), ("open_id", "TEXT")):
+            if col not in cols:
+                self.x(f"ALTER TABLE accounts ADD COLUMN {col} {typ}")
+        if "caption_out" not in self._columns("reposts"):
+            self.x("ALTER TABLE reposts ADD COLUMN caption_out TEXT")
+        if "account_id" not in self._columns("creators"):
+            self.x("ALTER TABLE creators ADD COLUMN account_id INTEGER")
+        old = {r["key"]: json.loads(r["value"]) for r in self.q("SELECT key, value FROM settings")}
+        if not self.q("SELECT 1 FROM accounts LIMIT 1") and old.get("ig_user_id") and old.get("ig_access_token"):
+            acc, _ = self.x("INSERT INTO accounts(name, ig_user_id, access_token, times, created_at) VALUES (?,?,?,?,?)",
+                            ("My Instagram", old["ig_user_id"], old["ig_access_token"],
+                             json.dumps(DEFAULT_TIMES), now()))
+            self.x("UPDATE creators SET account_id=? WHERE account_id IS NULL", (acc,))
+            tables = {r["name"] for r in self.q("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "posts" in tables:  # remember what was already posted so it isn't reposted
+                self.x("INSERT OR IGNORE INTO reposts(account_id, creator_id, source, post_id, url, status, created_at, posted_at) "
+                       "SELECT ?, creator_id, source, post_id, url, 'posted', found_at, posted_at FROM posts WHERE status='posted'",
+                       (acc,))
+            self.log("info", "Moved your Instagram connection into Accounts. Set its posting times there.")
+        # creators can now repost to several accounts; carry over the single-account links
+        if not self.q("SELECT 1 FROM creator_accounts LIMIT 1"):
+            self.x("INSERT OR IGNORE INTO creator_accounts(creator_id, account_id) "
+                   "SELECT id, account_id FROM creators WHERE account_id IS NOT NULL")
+        for k in ("ig_user_id", "ig_access_token", "tiktok_tokens"):
+            self.x("DELETE FROM settings WHERE key=?", (k,))
 
-    def random_unposted(self, s, acc, cr):
-        src = cr["pull_from"]
-        handle = (cr.get(src) or "").lstrip("@").strip()
-        if not handle:
-            return None
-        try:
-            if src == "tiktok":
-                posts = list(fetch_tiktok(handle, s["scan_depth"]))
-            else:
-                posts = list(fetch_instagram(make_ig_loader(s), handle, s["scan_depth"]))
-        except Exception as e:
-            self.store.log("warn", f"Couldn't load @{handle}'s {src}: {short(e)}")
-            return None
-        done = {(r["source"], r["post_id"]): r for r in self.store.q(
-            "SELECT source, post_id, status, attempts FROM reposts WHERE account_id=?", (acc["id"],))}
-        options = [p for p in posts
-                   if (r := done.get((p["source"], p["post_id"]))) is None
-                   or (r["status"] == "failed" and r["attempts"] < MAX_ATTEMPTS)]
-        return random.choice(options) if options else None
+    # ---- settings ----
+    def settings(self):
+        s = dict(DEFAULTS)
+        for r in self.q("SELECT key, value FROM settings"):
+            if r["key"] in DEFAULTS:
+                s[r["key"]] = json.loads(r["value"])
+        return s
 
-    def post_video(self, s, acc, cr, p):
-        """p is a fetched post dict or an existing reposts row. Returns True if it posted."""
-        self.store.x("INSERT OR IGNORE INTO reposts(account_id, creator_id, source, post_id, url, status, created_at)"
-                     " VALUES (?,?,?,?,?,?,?)",
-                     (acc["id"], cr["id"], p["source"], p["post_id"], p["url"], "posting", now()))
-        row = self.store.q("SELECT * FROM reposts WHERE account_id=? AND source=? AND post_id=?",
-                           (acc["id"], p["source"], p["post_id"]))[0]
-        work = Path(tempfile.mkdtemp(dir=self.tmp))
-        try:
-            if p["source"] == "tiktok":
-                path, caption = download_tiktok(p["url"], work)
-            else:
-                path, caption = download_instagram(make_ig_loader(s), p["post_id"], work)
-            video = prepare_video(path, work)
-            platform = acc.get("platform") or "instagram"
-            text = build_caption(s, cr, caption, p["url"], platform)
-            if platform == "tiktok":
-                media_id = post_tiktok(self.store, s, acc, video, text)
-            else:
-                media_id = post_instagram(s, acc, video, text, self.link_for)
-            self.store.x("UPDATE reposts SET status='posted', posted_at=?, error=NULL, ig_media_id=?, caption_out=? "
-                         "WHERE id=?", (now(), media_id, text, row["id"]))
-            where = " (in TikTok drafts)" if platform == "tiktok" and s["tiktok_mode"] == "inbox" else ""
-            self.store.log("info", f"{acc['name']}: posted {cr['name']}'s video{where}")
-            return True
-        except Exception as e:
-            attempts = (row["attempts"] or 0) + 1
-            self.store.x("UPDATE reposts SET status='failed', attempts=?, error=? WHERE id=?",
-                         (attempts, short(e), row["id"]))
-            self.store.log("error", f"{acc['name']}: couldn't post {cr['name']}'s video ({short(e)})")
-            return False
-        finally:
-            for t in [t for t, f in self.public.items() if f.parent == work]:
-                self.public.pop(t, None)
-            for f in work.glob("*"):
-                f.unlink(missing_ok=True)
-            work.rmdir()
+    def set_settings(self, values):
+        for k, v in values.items():
+            if k in DEFAULTS:
+                self.x("INSERT INTO settings(key, value) VALUES(?, ?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, json.dumps(v)))
+
+    # ---- accounts ----
+    def accounts(self, enabled_only=False):
+        rows = self.q("SELECT * FROM accounts" + (" WHERE enabled=1" if enabled_only else "") +
+                      " ORDER BY name COLLATE NOCASE")
+        for r in rows:
+            r["times"] = json.loads(r["times"] or "[]")
+        return rows
+
+    def account(self, account_id):
+        rows = self.q("SELECT * FROM accounts WHERE id=?", (account_id,))
+        if rows:
+            rows[0]["times"] = json.loads(rows[0]["times"] or "[]")
+        return rows[0] if rows else None
+
+    def creator_accounts(self):
+        """{creator_id: [account_id, ...]}"""
+        out = {}
+        for r in self.q("SELECT creator_id, account_id FROM creator_accounts ORDER BY account_id"):
+            out.setdefault(r["creator_id"], []).append(r["account_id"])
+        return out
+
+    def set_creator_accounts(self, creator_id, account_ids):
+        self.x("DELETE FROM creator_accounts WHERE creator_id=?", (creator_id,))
+        for a in account_ids:
+            self.x("INSERT OR IGNORE INTO creator_accounts VALUES (?, ?)", (creator_id, a))
+
+    # ---- activity log ----
+    def log(self, level, msg):
+        print(f"[{level}] {msg}", flush=True)
+        self.x("INSERT INTO events(ts, level, msg) VALUES(?,?,?)", (now(), level, str(msg)[:1000]))
+        self.x("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 300)")
