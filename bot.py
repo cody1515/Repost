@@ -276,7 +276,21 @@ def tiktok_token(store, acc):
     return d["access_token"]
 
 
-def post_tiktok(store, s, acc, video, caption):
+def _tt_error(d):
+    err = d.get("error") or {}
+    if err.get("code") not in (None, "ok"):
+        raise RuntimeError(f"TikTok ({err.get('code')}): {err.get('message') or 'request failed'}")
+
+
+def tiktok_creator_info(store, acc):
+    """Latest posting info for the connected TikTok account (TikTok asks apps to fetch this each time)."""
+    h = {"Authorization": f"Bearer {tiktok_token(store, acc)}", "Content-Type": "application/json; charset=UTF-8"}
+    d = requests.post(f"{TT_API}/post/publish/creator_info/query/", headers=h, timeout=30).json()
+    _tt_error(d)
+    return d.get("data", {})
+
+
+def _tt_upload(store, acc, video, init_url, extra):
     h = {"Authorization": f"Bearer {tiktok_token(store, acc)}", "Content-Type": "application/json; charset=UTF-8"}
     size = video.stat().st_size
     if size <= 64 * 1024 * 1024:
@@ -284,26 +298,10 @@ def post_tiktok(store, s, acc, video, caption):
     else:  # TikTok rule: 10MB chunks, the last one absorbs the remainder
         chunk = 10 * 1024 * 1024
         count = size // chunk
-    source = {"source": "FILE_UPLOAD", "video_size": size, "chunk_size": chunk, "total_chunk_count": count}
-
-    if s["tiktok_mode"] == "inbox":
-        url, body = f"{TT_API}/post/publish/inbox/video/init/", {"source_info": source}
-    else:
-        info = check(requests.post(f"{TT_API}/post/publish/creator_info/query/", headers=h,
-                                   timeout=30)).json().get("data", {})
-        privacy = s["tiktok_privacy"]
-        options = info.get("privacy_level_options") or []
-        if options and privacy not in options:
-            privacy = "SELF_ONLY" if "SELF_ONLY" in options else options[0]
-        url = f"{TT_API}/post/publish/video/init/"
-        body = {"source_info": source, "post_info": {
-            "title": caption, "privacy_level": privacy,
-            "disable_comment": False, "disable_duet": False, "disable_stitch": False}}
-
-    d = requests.post(url, headers=h, json=body, timeout=60).json()
-    err = d.get("error") or {}
-    if err.get("code") not in (None, "ok"):
-        raise RuntimeError(f"TikTok: {err.get('message') or err.get('code')}")
+    body = {"source_info": {"source": "FILE_UPLOAD", "video_size": size,
+                            "chunk_size": chunk, "total_chunk_count": count}, **extra}
+    d = requests.post(init_url, headers=h, json=body, timeout=60).json()
+    _tt_error(d)
     publish_id, upload_url = d["data"]["publish_id"], d["data"]["upload_url"]
 
     with open(video, "rb") as f:
@@ -316,7 +314,7 @@ def post_tiktok(store, s, acc, video, caption):
                 "Content-Type": "video/mp4", "Content-Length": str(len(data)),
                 "Content-Range": f"bytes {start}-{end}/{size}"}))
 
-    for _ in range(60):
+    for _ in range(90):
         st = requests.post(f"{TT_API}/post/publish/status/fetch/", headers=h,
                            json={"publish_id": publish_id}, timeout=30).json().get("data", {})
         if st.get("status") in ("PUBLISH_COMPLETE", "SEND_TO_USER_INBOX"):
@@ -325,6 +323,33 @@ def post_tiktok(store, s, acc, video, caption):
             raise RuntimeError(f"TikTok rejected it: {st.get('fail_reason')}")
         time.sleep(10)
     return publish_id  # still processing on TikTok's side; it finishes on its own
+
+
+def post_tiktok_draft(store, acc, video):
+    """Sends the video to the account's TikTok inbox; the owner finishes posting in the TikTok app."""
+    return _tt_upload(store, acc, video, f"{TT_API}/post/publish/inbox/video/init/", {})
+
+
+def post_tiktok_direct(store, acc, video, caption, opts):
+    """Publishes with the settings the owner picked on the approval screen."""
+    return _tt_upload(store, acc, video, f"{TT_API}/post/publish/video/init/", {"post_info": {
+        "title": caption,
+        "privacy_level": opts["privacy"],
+        "disable_comment": not opts.get("comment"),
+        "disable_duet": not opts.get("duet"),
+        "disable_stitch": not opts.get("stitch"),
+        "brand_organic_toggle": bool(opts.get("your_brand")),
+        "brand_content_toggle": bool(opts.get("branded")),
+    }})
+
+
+def video_duration(path):
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+                              str(path)], capture_output=True, text=True, timeout=60).stdout.strip()
+        return float(out)
+    except Exception:
+        return None
 
 
 def discover_accounts(version, user_token):
@@ -376,6 +401,8 @@ class Engine:
         self.store = store
         self.tmp = Path(data_dir) / "tmp"
         self.tmp.mkdir(parents=True, exist_ok=True)
+        self.pending_dir = Path(data_dir) / "pending"   # TikTok videos waiting for your approval
+        self.pending_dir.mkdir(parents=True, exist_ok=True)
         self.wake = threading.Event()
         self.pending = []          # account ids queued by "Post now"
         self.public = {}           # token -> file, served briefly at /media/<token>.mp4 for Instagram to fetch
@@ -433,6 +460,12 @@ class Engine:
     # ---- one posting slot ----
     def fire(self, s, acc, why):
         self.status = f"Posting to {acc['name']}"
+        if acc.get("platform") == "tiktok" and s["tiktok_mode"] == "direct":
+            waiting = self.store.q("SELECT COUNT(*) n FROM reposts WHERE account_id=? AND status='awaiting'",
+                                   (acc["id"],))[0]["n"]
+            if waiting >= 5:
+                self.store.log("warn", f"{acc['name']}: 5 videos are already waiting for approval, so none was added")
+                return False
         # 1) links you added by hand go first
         for row in self.store.q("SELECT * FROM reposts WHERE account_id=? AND status='queued' ORDER BY id",
                                 (acc["id"],)):
@@ -468,6 +501,30 @@ class Engine:
                     break
         self.store.log("warn", f"{acc['name']}: nothing could be posted for the {why}")
         return False
+
+    # ---- TikTok approval ----
+    def publish_approved(self, repost_id, caption, opts):
+        """Runs in the background after you tap Post to TikTok on the approval screen."""
+        def run():
+            row = self.store.q("SELECT * FROM reposts WHERE id=?", (repost_id,))[0]
+            acc = self.store.account(row["account_id"])
+            try:
+                pid = post_tiktok_direct(self.store, acc, Path(row["file"]), caption, opts)
+                self.store.x("UPDATE reposts SET status='posted', posted_at=?, ig_media_id=?, caption_out=?, error=NULL,"
+                             " file=NULL WHERE id=?", (now(), pid, caption, repost_id))
+                Path(row["file"]).unlink(missing_ok=True)
+                self.store.log("info", f"{acc['name']}: posted to TikTok")
+            except Exception as e:
+                self.store.x("UPDATE reposts SET status='awaiting', error=? WHERE id=?", (short(e), repost_id))
+                self.store.log("error", f"{acc['name']}: TikTok post failed ({short(e)})")
+        self.store.x("UPDATE reposts SET status='publishing', error=NULL WHERE id=?", (repost_id,))
+        threading.Thread(target=run, daemon=True).start()
+
+    def discard_pending(self, repost_id):
+        row = self.store.q("SELECT file FROM reposts WHERE id=?", (repost_id,))
+        if row and row[0]["file"]:
+            Path(row[0]["file"]).unlink(missing_ok=True)
+        self.store.x("UPDATE reposts SET status='skipped', file=NULL WHERE id=?", (repost_id,))
 
     def random_unposted(self, s, acc, cr):
         src = cr["pull_from"]
@@ -511,8 +568,15 @@ class Engine:
             video = prepare_video(path, work)
             platform = acc.get("platform") or "instagram"
             text = build_caption(s, cr, caption, p["url"], platform)
+            if platform == "tiktok" and s["tiktok_mode"] == "direct":
+                dest = self.pending_dir / f"{row['id']}.mp4"
+                shutil.move(str(video), dest)
+                self.store.x("UPDATE reposts SET status='awaiting', file=?, duration=?, caption_out=?, error=NULL "
+                             "WHERE id=?", (str(dest), video_duration(dest), text, row["id"]))
+                self.store.log("info", f"{acc['name']}: {cr['name']}'s video is ready for your approval")
+                return True
             if platform == "tiktok":
-                media_id = post_tiktok(self.store, s, acc, video, text)
+                media_id = post_tiktok_draft(self.store, acc, video)
             else:
                 media_id = post_instagram(s, acc, video, text, self.link_for)
             self.store.x("UPDATE reposts SET status='posted', posted_at=?, error=NULL, ig_media_id=?, caption_out=? "
