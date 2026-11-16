@@ -96,8 +96,10 @@ class Store:
                          ("token_expires", "REAL DEFAULT 0"), ("open_id", "TEXT")):
             if col not in cols:
                 self.x(f"ALTER TABLE accounts ADD COLUMN {col} {typ}")
-        if "caption_out" not in self._columns("reposts"):
-            self.x("ALTER TABLE reposts ADD COLUMN caption_out TEXT")
+        rcols = self._columns("reposts")
+        for col, typ in (("caption_out", "TEXT"), ("file", "TEXT"), ("duration", "REAL")):
+            if col not in rcols:
+                self.x(f"ALTER TABLE reposts ADD COLUMN {col} {typ}")
         if "account_id" not in self._columns("creators"):
             self.x("ALTER TABLE creators ADD COLUMN account_id INTEGER")
         old = {r["key"]: json.loads(r["value"]) for r in self.q("SELECT key, value FROM settings")}
