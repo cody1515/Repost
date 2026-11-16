@@ -184,6 +184,9 @@ class Handler(BaseHTTPRequestHandler):
         p = urllib.parse.urlparse(self.path).path
         if p == "/health":
             return self.send(200, {"ok": True})
+        verify_name = os.environ.get("TIKTOK_VERIFY_FILE", "").strip().lstrip("/")
+        if verify_name and p == "/" + verify_name:  # TikTok URL-ownership check
+            return self.send(200, os.environ.get("TIKTOK_VERIFY_CONTENT", "").strip(), "text/plain; charset=utf-8")
         if p in ("/terms", "/privacy"):
             return self.send(200, legal_page(p[1:]), "text/html; charset=utf-8")
         if p in ("/", "/index.html"):
