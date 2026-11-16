@@ -37,8 +37,12 @@ DEFAULTS = {
     # optional login used only to READ creators' Instagram pages
     "ig_reader_username": "",
     "ig_sessionid": "",
+    # TikTok posting
+    "tiktok_mode": "inbox",            # inbox = lands in TikTok drafts; direct = posts on its own
+    "tiktok_privacy": "PUBLIC_TO_EVERYONE",
+    "tiktok_oauth_state": "",
 }
-SECRET_KEYS = {"ig_sessionid"}
+SECRET_KEYS = {"ig_sessionid", "tiktok_oauth_state"}
 DEFAULT_TIMES = ["12:00", "19:00"]
 
 
@@ -86,7 +90,14 @@ class Store:
         return {r["name"] for r in self.q(f"PRAGMA table_info({table})")}
 
     def _migrate(self):
-        """Bring data over from the single-account version of the app."""
+        """Bring data over from older versions of the app."""
+        cols = self._columns("accounts")
+        for col, typ in (("platform", "TEXT DEFAULT 'instagram'"), ("refresh_token", "TEXT"),
+                         ("token_expires", "REAL DEFAULT 0"), ("open_id", "TEXT")):
+            if col not in cols:
+                self.x(f"ALTER TABLE accounts ADD COLUMN {col} {typ}")
+        if "caption_out" not in self._columns("reposts"):
+            self.x("ALTER TABLE reposts ADD COLUMN caption_out TEXT")
         if "account_id" not in self._columns("creators"):
             self.x("ALTER TABLE creators ADD COLUMN account_id INTEGER")
         old = {r["key"]: json.loads(r["value"]) for r in self.q("SELECT key, value FROM settings")}
@@ -105,7 +116,7 @@ class Store:
         if not self.q("SELECT 1 FROM creator_accounts LIMIT 1"):
             self.x("INSERT OR IGNORE INTO creator_accounts(creator_id, account_id) "
                    "SELECT id, account_id FROM creators WHERE account_id IS NOT NULL")
-        for k in ("ig_user_id", "ig_access_token", "tiktok_tokens", "tiktok_oauth_state"):
+        for k in ("ig_user_id", "ig_access_token", "tiktok_tokens"):
             self.x("DELETE FROM settings WHERE key=?", (k,))
 
     # ---- settings ----
