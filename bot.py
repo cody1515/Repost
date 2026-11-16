@@ -12,9 +12,13 @@ import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import os
+
 import requests
 
 from store import now
+
+TT_API = "https://open.tiktokapis.com/v2"
 
 CAPTION_LIMIT = 2200
 MAX_ATTEMPTS = 3
@@ -217,6 +221,96 @@ def post_instagram(s, acc, video, caption, link_for=None):
             raise RuntimeError(f"direct upload: {short(first)} / link upload: {short(second)}")
 
 
+# --------------------------------------------------------------------------- #
+# TikTok (Content Posting API)
+# --------------------------------------------------------------------------- #
+def tiktok_exchange(data):
+    r = requests.post(f"{TT_API}/oauth/token/", data={
+        "client_key": os.environ.get("TIKTOK_CLIENT_KEY", ""),
+        "client_secret": os.environ.get("TIKTOK_CLIENT_SECRET", ""), **data},
+        headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=30)
+    d = r.json() if r.content else {}
+    if "access_token" not in d:
+        raise RuntimeError(f"TikTok login failed: {d.get('error_description') or d.get('error') or r.status_code}")
+    return d
+
+
+def tiktok_display_name(token):
+    r = requests.get(f"{TT_API}/user/info/", params={"fields": "open_id,display_name"},
+                     headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    try:
+        return r.json()["data"]["user"].get("display_name") or ""
+    except Exception:
+        return ""
+
+
+def tiktok_token(store, acc):
+    """Current access token for a TikTok account, refreshing it when it's about to expire."""
+    if not acc.get("refresh_token"):
+        raise RuntimeError("TikTok isn't connected. Tap Reconnect on this account.")
+    if time.time() < (acc.get("token_expires") or 0) - 300:
+        return acc["access_token"]
+    try:
+        d = tiktok_exchange({"grant_type": "refresh_token", "refresh_token": acc["refresh_token"]})
+    except RuntimeError as e:
+        raise RuntimeError(f"{e}. Tap Reconnect on this account.")
+    store.x("UPDATE accounts SET access_token=?, refresh_token=?, token_expires=? WHERE id=?",
+            (d["access_token"], d.get("refresh_token") or acc["refresh_token"],
+             time.time() + d.get("expires_in", 86400), acc["id"]))
+    return d["access_token"]
+
+
+def post_tiktok(store, s, acc, video, caption):
+    h = {"Authorization": f"Bearer {tiktok_token(store, acc)}", "Content-Type": "application/json; charset=UTF-8"}
+    size = video.stat().st_size
+    if size <= 64 * 1024 * 1024:
+        chunk, count = size, 1
+    else:  # TikTok rule: 10MB chunks, the last one absorbs the remainder
+        chunk = 10 * 1024 * 1024
+        count = size // chunk
+    source = {"source": "FILE_UPLOAD", "video_size": size, "chunk_size": chunk, "total_chunk_count": count}
+
+    if s["tiktok_mode"] == "inbox":
+        url, body = f"{TT_API}/post/publish/inbox/video/init/", {"source_info": source}
+    else:
+        info = check(requests.post(f"{TT_API}/post/publish/creator_info/query/", headers=h,
+                                   timeout=30)).json().get("data", {})
+        privacy = s["tiktok_privacy"]
+        options = info.get("privacy_level_options") or []
+        if options and privacy not in options:
+            privacy = "SELF_ONLY" if "SELF_ONLY" in options else options[0]
+        url = f"{TT_API}/post/publish/video/init/"
+        body = {"source_info": source, "post_info": {
+            "title": caption, "privacy_level": privacy,
+            "disable_comment": False, "disable_duet": False, "disable_stitch": False}}
+
+    d = requests.post(url, headers=h, json=body, timeout=60).json()
+    err = d.get("error") or {}
+    if err.get("code") not in (None, "ok"):
+        raise RuntimeError(f"TikTok: {err.get('message') or err.get('code')}")
+    publish_id, upload_url = d["data"]["publish_id"], d["data"]["upload_url"]
+
+    with open(video, "rb") as f:
+        for i in range(count):
+            start = i * chunk
+            end = size - 1 if i == count - 1 else start + chunk - 1
+            f.seek(start)
+            data = f.read(end - start + 1)
+            check(requests.put(upload_url, data=data, timeout=900, headers={
+                "Content-Type": "video/mp4", "Content-Length": str(len(data)),
+                "Content-Range": f"bytes {start}-{end}/{size}"}))
+
+    for _ in range(60):
+        st = requests.post(f"{TT_API}/post/publish/status/fetch/", headers=h,
+                           json={"publish_id": publish_id}, timeout=30).json().get("data", {})
+        if st.get("status") in ("PUBLISH_COMPLETE", "SEND_TO_USER_INBOX"):
+            return publish_id
+        if st.get("status") == "FAILED":
+            raise RuntimeError(f"TikTok rejected it: {st.get('fail_reason')}")
+        time.sleep(10)
+    return publish_id  # still processing on TikTok's side; it finishes on its own
+
+
 def discover_accounts(version, user_token):
     """List the Instagram accounts reachable with a (long-lived) user token."""
     r = check(requests.get(f"https://graph.facebook.com/{version}/me/accounts", params={
@@ -240,8 +334,9 @@ def account_username(version, acc):
 # --------------------------------------------------------------------------- #
 # Captions
 # --------------------------------------------------------------------------- #
-def build_caption(s, creator, original, url):
-    handle = (creator.get("instagram") or creator.get(creator["pull_from"]) or "").lstrip("@").strip()
+def build_caption(s, creator, original, url, platform="instagram"):
+    """Credit uses the creator's handle on the app you're posting to, if you have it."""
+    handle = (creator.get(platform) or creator.get(creator["pull_from"]) or "").lstrip("@").strip()
     credit = s["credit_format"].replace("{handle}", handle)
     tmpl = s["caption_template"]
 
@@ -386,10 +481,16 @@ class Engine:
             else:
                 path, caption = download_instagram(make_ig_loader(s), p["post_id"], work)
             video = prepare_video(path, work)
-            media_id = post_instagram(s, acc, video, build_caption(s, cr, caption, p["url"]), self.link_for)
-            self.store.x("UPDATE reposts SET status='posted', posted_at=?, error=NULL, ig_media_id=? WHERE id=?",
-                         (now(), media_id, row["id"]))
-            self.store.log("info", f"{acc['name']}: posted {cr['name']}'s video")
+            platform = acc.get("platform") or "instagram"
+            text = build_caption(s, cr, caption, p["url"], platform)
+            if platform == "tiktok":
+                media_id = post_tiktok(self.store, s, acc, video, text)
+            else:
+                media_id = post_instagram(s, acc, video, text, self.link_for)
+            self.store.x("UPDATE reposts SET status='posted', posted_at=?, error=NULL, ig_media_id=?, caption_out=? "
+                         "WHERE id=?", (now(), media_id, text, row["id"]))
+            where = " (in TikTok drafts)" if platform == "tiktok" and s["tiktok_mode"] == "inbox" else ""
+            self.store.log("info", f"{acc['name']}: posted {cr['name']}'s video{where}")
             return True
         except Exception as e:
             attempts = (row["attempts"] or 0) + 1
