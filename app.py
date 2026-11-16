@@ -37,6 +37,58 @@ def static_file(name):
     return base64.b64decode(_EMBEDDED[name])
 
 
+LEGAL_STYLE = """<style>body{margin:0;background:#0e0f12;color:#e8eaf0;font:16px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
+main{max-width:720px;margin:0 auto;padding:32px 20px 60px}h1{font-size:28px;margin:0 0 4px}h2{font-size:18px;margin:28px 0 6px}
+p,li{color:#c3c8d4}a{color:#25d6c4}.muted{color:#8b92a1;font-size:14px}</style>"""
+
+
+def legal_page(kind):
+    app_name = os.environ.get("APP_NAME", "Repost")
+    owner = os.environ.get("OPERATOR_NAME", "the owner of this app")
+    contact = os.environ.get("CONTACT_EMAIL", "")
+    contact_line = (f'<p>Questions: <a href="mailto:{contact}">{contact}</a></p>' if contact
+                    else "<p>Questions can be sent to the owner of this app.</p>")
+    updated = "November 15, 2026"
+    if kind == "terms":
+        body = f"""<h1>Terms of Service</h1><p class="muted">{app_name} · Last updated {updated}</p>
+<p>{app_name} is a private tool run by {owner}. It is used only to post videos to social media accounts that {owner} owns or manages. By using it, you agree to these terms.</p>
+<h2>What the app does</h2>
+<p>The app takes short videos from creators who have given permission for their content to be reposted and publishes them, with credit to the creator, to accounts connected to the app. It posts through the official Instagram Graph API and TikTok Content Posting API.</p>
+<h2>Who can use it</h2>
+<p>The app is not open to the public. Only {owner} can log in. Anyone who connects an account must own that account or be authorized to manage it.</p>
+<h2>Content and permission</h2>
+<ul><li>Videos are reposted only from creators who have given permission.</li>
+<li>Every repost credits the original creator.</li>
+<li>If you are a creator and want your content removed or no longer reposted, contact us using the details below and it will be taken down.</li></ul>
+<h2>Platform rules</h2>
+<p>Use of the app must follow the terms and community guidelines of TikTok and Instagram (Meta).</p>
+<h2>No warranty</h2>
+<p>The app is provided as is, without any warranty. We are not responsible for any outage, posting failure or loss of data.</p>
+<h2>Changes</h2>
+<p>These terms may be updated from time to time. The date above shows the latest version.</p>
+<h2>Contact</h2>{contact_line}"""
+    else:
+        body = f"""<h1>Privacy Policy</h1><p class="muted">{app_name} · Last updated {updated}</p>
+<p>{app_name} is a private tool run by {owner} for posting to accounts {owner} owns or manages. This policy explains what data it handles.</p>
+<h2>What we collect</h2>
+<ul><li><b>Account connection data:</b> when a TikTok or Instagram account is connected, the app stores the access tokens, account IDs and display names that TikTok or Meta provide. These are needed to post to that account.</li>
+<li><b>Posting records:</b> which videos were posted, to which account, when, and any error messages.</li>
+<li><b>Creator details:</b> the public usernames of creators whose videos are reposted with permission.</li></ul>
+<p>The app does not collect information from followers or viewers, and it does not use cookies except one login cookie for the app owner.</p>
+<h2>How we use it</h2>
+<p>This data is used only to publish videos to the connected accounts and to show the owner what has been posted. It is not sold, rented or shared with anyone, and it is not used for advertising.</p>
+<h2>Where it is stored</h2>
+<p>Data is stored on the app's private server and is sent only to TikTok and Meta when posting. Videos are stored temporarily while they are being posted and deleted right after.</p>
+<h2>Deleting your data</h2>
+<p>Removing an account in the app deletes its stored tokens. You can also revoke the app's access at any time in your TikTok settings (Security and permissions → Manage app permissions) or in Facebook settings (Business integrations). To ask for any other data to be deleted, use the contact details below.</p>
+<h2>Children</h2>
+<p>The app is not intended for anyone under 18.</p>
+<h2>Changes</h2>
+<p>This policy may be updated from time to time. The date above shows the latest version.</p>
+<h2>Contact</h2>{contact_line}"""
+    return f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{app_name}</title>{LEGAL_STYLE}</head><body><main>{body}</main></body></html>'
+
+
 def public_url():
     if os.environ.get("PUBLIC_URL"):
         return os.environ["PUBLIC_URL"].rstrip("/")
@@ -132,6 +184,8 @@ class Handler(BaseHTTPRequestHandler):
         p = urllib.parse.urlparse(self.path).path
         if p == "/health":
             return self.send(200, {"ok": True})
+        if p in ("/terms", "/privacy"):
+            return self.send(200, legal_page(p[1:]), "text/html; charset=utf-8")
         if p in ("/", "/index.html"):
             return self.send(200, static_file("index.html"), "text/html; charset=utf-8")
         if p == "/manifest.json":
