@@ -93,7 +93,8 @@ class Store:
         """Bring data over from older versions of the app."""
         cols = self._columns("accounts")
         for col, typ in (("platform", "TEXT DEFAULT 'instagram'"), ("refresh_token", "TEXT"),
-                         ("token_expires", "REAL DEFAULT 0"), ("open_id", "TEXT")):
+                         ("token_expires", "REAL DEFAULT 0"), ("open_id", "TEXT"),
+                         ("zernio_id", "TEXT"), ("tt_settings", "TEXT")):
             if col not in cols:
                 self.x(f"ALTER TABLE accounts ADD COLUMN {col} {typ}")
         rcols = self._columns("reposts")
