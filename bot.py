@@ -352,6 +352,91 @@ def video_duration(path):
         return None
 
 
+# --------------------------------------------------------------------------- #
+# TikTok through Zernio (an already-approved posting service)
+# --------------------------------------------------------------------------- #
+ZERNIO_API = "https://zernio.com/api/v1"
+TT_DEFAULTS = {"privacy_level": "PUBLIC_TO_EVERYONE", "allow_comment": True, "allow_duet": True,
+               "allow_stitch": True, "draft": False, "auto_consent": False}
+
+
+def tt_settings(acc):
+    try:
+        return {**TT_DEFAULTS, **json.loads(acc.get("tt_settings") or "{}")}
+    except Exception:
+        return dict(TT_DEFAULTS)
+
+
+def _zernio(method, path, **kw):
+    key = os.environ.get("ZERNIO_API_KEY", "")
+    if not key:
+        raise RuntimeError("Add ZERNIO_API_KEY in Railway Variables")
+    r = requests.request(method, ZERNIO_API + path, timeout=kw.pop("timeout", 60),
+                         headers={"Authorization": f"Bearer {key}"}, **kw)
+    try:
+        d = r.json()
+    except Exception:
+        d = {}
+    if not r.ok:
+        msg = d.get("error") or d.get("message") or r.text[:300]
+        raise RuntimeError(f"Zernio {r.status_code}: {msg}")
+    return d
+
+
+def zernio_tiktok_accounts():
+    d = _zernio("GET", "/accounts")
+    out = []
+    for a in d.get("accounts", d if isinstance(d, list) else []):
+        if a.get("platform") == "tiktok":
+            out.append({"zernio_id": a.get("_id") or a.get("id") or a.get("accountId"),
+                        "username": a.get("username") or "", "display_name": a.get("displayName") or "",
+                        "active": a.get("isActive", True)})
+    return out
+
+
+def post_tiktok_zernio(acc, video, caption):
+    """Upload the file to Zernio, then ask Zernio to publish it to TikTok."""
+    st = tt_settings(acc)
+    if not st["auto_consent"]:
+        raise RuntimeError("Auto-posting isn't turned on for this TikTok account (Accounts → Edit)")
+    pre = _zernio("POST", "/media/presign", json={"filename": "video.mp4", "contentType": "video/mp4",
+                                                   "size": video.stat().st_size})
+    with open(video, "rb") as f:
+        check(requests.put(pre["uploadUrl"], data=f, headers={"Content-Type": "video/mp4"}, timeout=900))
+    settings = {"privacy_level": st["privacy_level"], "allow_comment": bool(st["allow_comment"]),
+                "allow_duet": bool(st["allow_duet"]), "allow_stitch": bool(st["allow_stitch"]),
+                "content_preview_confirmed": True, "express_consent_given": True}
+    if st["draft"]:
+        settings["draft"] = True
+    d = _zernio("POST", "/posts", timeout=300, json={
+        "content": caption,
+        "mediaItems": [{"type": "video", "url": pre["publicUrl"]}],
+        "platforms": [{"platform": "tiktok", "accountId": acc["zernio_id"]}],
+        "tiktokSettings": settings,
+        "publishNow": True})
+    post = d.get("post") or d
+    post_id = post.get("_id") or post.get("id") or ""
+
+    # Wait briefly for the result; Zernio keeps retrying on its own if TikTok is slow
+    for attempt in range(30):
+        plats = post.get("platforms") or []
+        pstat = (plats[0].get("status") if plats else None) or post.get("status")
+        if pstat in ("published", "posted", "completed", "success"):
+            return post_id
+        if pstat in ("failed", "error"):
+            err = (plats[0].get("error") or plats[0].get("errorMessage") if plats else None) or post.get("error")
+            raise RuntimeError(f"TikTok via Zernio failed: {err or 'no reason given'}")
+        if not post_id:
+            return ""
+        time.sleep(10)
+        try:
+            got = _zernio("GET", f"/posts/{post_id}")
+            post = got.get("post") or got
+        except RuntimeError:
+            pass
+    return post_id  # still processing; Zernio finishes it
+
+
 def discover_accounts(version, user_token):
     """List the Instagram accounts reachable with a (long-lived) user token."""
     r = check(requests.get(f"https://graph.facebook.com/{version}/me/accounts", params={
@@ -460,7 +545,10 @@ class Engine:
     # ---- one posting slot ----
     def fire(self, s, acc, why):
         self.status = f"Posting to {acc['name']}"
-        if acc.get("platform") == "tiktok" and s["tiktok_mode"] == "direct":
+        if acc.get("zernio_id") and not tt_settings(acc)["auto_consent"]:
+            self.store.log("warn", f"{acc['name']}: auto-posting is off, so nothing was posted (Accounts → Edit)")
+            return False
+        if acc.get("platform") == "tiktok" and not acc.get("zernio_id") and s["tiktok_mode"] == "direct":
             waiting = self.store.q("SELECT COUNT(*) n FROM reposts WHERE account_id=? AND status='awaiting'",
                                    (acc["id"],))[0]["n"]
             if waiting >= 5:
@@ -568,6 +656,13 @@ class Engine:
             video = prepare_video(path, work)
             platform = acc.get("platform") or "instagram"
             text = build_caption(s, cr, caption, p["url"], platform)
+            if platform == "tiktok" and acc.get("zernio_id"):
+                media_id = post_tiktok_zernio(acc, video, text)
+                self.store.x("UPDATE reposts SET status='posted', posted_at=?, error=NULL, ig_media_id=?, caption_out=? "
+                             "WHERE id=?", (now(), media_id, text, row["id"]))
+                drafts = " (in TikTok drafts)" if tt_settings(acc)["draft"] else ""
+                self.store.log("info", f"{acc['name']}: posted {cr['name']}'s video via Zernio{drafts}")
+                return True
             if platform == "tiktok" and s["tiktok_mode"] == "direct":
                 dest = self.pending_dir / f"{row['id']}.mp4"
                 shutil.move(str(video), dest)
