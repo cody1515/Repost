@@ -137,6 +137,42 @@ def fetch_instagram(L, handle, limit):
                    "pinned": bool(getattr(post, "is_pinned", False)), "date": post.date_utc}
 
 
+def business_discovery(s, reader, handle, limit):
+    """Read a public business/creator account's recent videos through Instagram's official API,
+    using one of your own connected accounts. Works from servers, unlike scraping."""
+    graph = f"https://graph.facebook.com/{s['ig_graph_version']}"
+    fields = (f"business_discovery.username({handle}){{username,media.limit({min(max(limit * 2, 10), 50)})"
+              "{id,media_type,media_url,permalink,caption,timestamp}}")
+    r = requests.get(f"{graph}/{reader['ig_user_id']}", params={"fields": fields,
+                     "access_token": reader["access_token"]}, timeout=30)
+    d = r.json() if r.content else {}
+    if not r.ok or "business_discovery" not in d:
+        msg = (d.get("error") or {}).get("message") or f"HTTP {r.status_code}"
+        if "business" in msg.lower() or "#110" in msg or "username" in msg.lower():
+            msg = f"@{handle} isn't a public business or creator account, or the username is wrong ({msg})"
+        raise RuntimeError(msg)
+    out = []
+    for m in (d["business_discovery"].get("media") or {}).get("data", []):
+        if m.get("media_type") != "VIDEO" or not m.get("media_url"):
+            continue  # skip photos, carousels and videos Instagram won't share
+        permalink = m.get("permalink") or ""
+        sc = re.search(r"/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", permalink)
+        out.append({"source": "instagram", "post_id": sc.group(1) if sc else m["id"],
+                    "url": permalink or f"https://www.instagram.com/p/{m['id']}/",
+                    "video_url": m["media_url"], "caption": m.get("caption") or ""})
+    return out[:limit]
+
+
+def download_url(url, dest):
+    path = dest / "video.mp4"
+    with requests.get(url, stream=True, timeout=180) as r:
+        check(r)
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
+    return path
+
+
 def download_instagram(L, shortcode, dest):
     import instaloader
     post = instaloader.Post.from_shortcode(L.context, shortcode)
@@ -207,6 +243,24 @@ def _wait_and_publish(graph, uid, tok, container):
         "creation_id": container, "access_token": tok}, timeout=60)).json()["id"]
 
 
+def collab_list(acc):
+    try:
+        return [u for u in json.loads(acc.get("collab") or "[]") if u][:3]
+    except Exception:
+        return []
+
+
+def accept_collab(s, acc, media_id):
+    """Accept a collab invite on one of your own accounts so the Reel shows on its profile too."""
+    graph = f"https://graph.facebook.com/{s['ig_graph_version']}"
+    r = requests.post(f"{graph}/{acc['ig_user_id']}/collaboration_invites", data={
+        "media_id": media_id, "accept": "true", "access_token": acc["access_token"]}, timeout=30)
+    d = r.json() if r.content else {}
+    if not r.ok or not d.get("success"):
+        raise RuntimeError((d.get("error") or {}).get("message") or f"HTTP {r.status_code}")
+    return True
+
+
 def post_instagram(s, acc, video, caption, link_for=None):
     """Upload the file directly; if Instagram's upload server rejects it, give Instagram a
     temporary private link to the file instead (link_for(path) -> public URL)."""
@@ -215,6 +269,9 @@ def post_instagram(s, acc, video, caption, link_for=None):
     v, tok, uid = s["ig_graph_version"], acc["access_token"], acc["ig_user_id"]
     graph = f"https://graph.facebook.com/{v}"
     base = {"media_type": "REELS", "caption": caption, "share_to_feed": "true", "access_token": tok}
+    collabs = collab_list(acc)
+    if collabs:  # up to 3 usernames; each gets a collab invite
+        base["collaborators"] = ",".join(collabs)
 
     try:
         container = check(requests.post(f"{graph}/{uid}/media", data={**base, "upload_type": "resumable"},
@@ -590,6 +647,40 @@ class Engine:
         self.store.log("warn", f"{acc['name']}: nothing could be posted for the {why}")
         return False
 
+    # ---- Instagram collabs ----
+    def accept_collabs_later(self, s, acc, cr, p, media_id):
+        """Invites take a moment to appear, so accept them on your own accounts in the background."""
+        own = {(a["username"] or "").lower(): a for a in self.store.accounts()
+               if a.get("platform", "instagram") == "instagram" and a["id"] != acc["id"] and a["username"]}
+        names = collab_list(acc)
+        outside = [u for u in names if u.lower() not in own]
+        if outside:
+            self.store.log("info", f"{acc['name']}: collab invite sent to " + ", ".join("@" + u for u in outside)
+                           + " (they need to accept it in Instagram)")
+
+        def run():
+            for u in names:
+                other = own.get(u.lower())
+                if not other:
+                    continue
+                for attempt in range(8):
+                    time.sleep(20 if attempt else 15)
+                    try:
+                        accept_collab(s, other, media_id)
+                        # it's on that profile now, so that account won't post the same video again
+                        self.store.x("INSERT OR IGNORE INTO reposts(account_id, creator_id, source, post_id, url, status,"
+                                     " created_at, posted_at, ig_media_id, error) VALUES (?,?,?,?,?,'posted',?,?,?,?)",
+                                     (other["id"], cr["id"], p["source"], p["post_id"], p["url"], now(), now(),
+                                      media_id, f"collab with {acc['name']}"))
+                        self.store.log("info", f"{other['name']}: accepted collab with {acc['name']}")
+                        break
+                    except Exception as e:
+                        last = short(e)
+                else:
+                    self.store.log("warn", f"{other['name']}: couldn't accept the collab from {acc['name']} ({last}). "
+                                           "Accept it in the Instagram app.")
+        threading.Thread(target=run, daemon=True).start()
+
     # ---- TikTok approval ----
     def publish_approved(self, repost_id, caption, opts):
         """Runs in the background after you tap Post to TikTok on the approval screen."""
@@ -614,6 +705,43 @@ class Engine:
             Path(row[0]["file"]).unlink(missing_ok=True)
         self.store.x("UPDATE reposts SET status='skipped', file=NULL WHERE id=?", (repost_id,))
 
+    def download_ig(self, s, acc, cr, p, work):
+        if p.get("video_url"):
+            return download_url(p["video_url"], work), p.get("caption", "")
+        # a link you pasted: find it in the creator's recent videos via the official API
+        handle = (cr.get("instagram") or "").lstrip("@").strip()
+        reader = self.ig_reader(acc)
+        if handle and reader:
+            try:
+                for m in business_discovery(s, reader, handle, 50):
+                    if m["post_id"] == p["post_id"]:
+                        return download_url(m["video_url"], work), m["caption"]
+            except Exception:
+                pass
+        return download_instagram(make_ig_loader(s), p["post_id"], work)
+
+    def ig_reader(self, acc):
+        """One of your connected Instagram accounts to read other accounts with."""
+        if acc.get("platform", "instagram") == "instagram" and acc.get("ig_user_id") and acc.get("access_token"):
+            return acc
+        for a in self.store.accounts():
+            if a.get("platform", "instagram") == "instagram" and a.get("ig_user_id") and a.get("access_token"):
+                return a
+        return None
+
+    def load_instagram(self, s, acc, handle):
+        reader = self.ig_reader(acc)
+        first = None
+        if reader:
+            try:
+                return business_discovery(s, reader, handle, s["scan_depth"])
+            except Exception as e:
+                first = e
+        try:  # fallback: old method (often blocked on servers)
+            return list(fetch_instagram(make_ig_loader(s), handle, s["scan_depth"]))
+        except Exception:
+            raise first or RuntimeError("couldn't read that Instagram account")
+
     def random_unposted(self, s, acc, cr):
         src = cr["pull_from"]
         handle = (cr.get(src) or "").lstrip("@").strip()
@@ -623,7 +751,7 @@ class Engine:
             if src == "tiktok":
                 posts = list(fetch_tiktok(handle, s["scan_depth"]))
             else:
-                posts = list(fetch_instagram(make_ig_loader(s), handle, s["scan_depth"]))
+                posts = self.load_instagram(s, acc, handle)
         except Exception as e:
             self.store.log("warn", f"Couldn't load @{handle}'s {src}: {short(e)}")
             return None
@@ -647,7 +775,7 @@ class Engine:
             if p["source"] == "tiktok":
                 path, caption = download_tiktok(p["url"], work)
             else:
-                path, caption = download_instagram(make_ig_loader(s), p["post_id"], work)
+                path, caption = self.download_ig(s, acc, cr, p, work)
             if not has_video(path):
                 self.store.x("UPDATE reposts SET status='skipped', error='photo post, not a video' WHERE id=?",
                              (row["id"],))
@@ -674,6 +802,8 @@ class Engine:
                 media_id = post_tiktok_draft(self.store, acc, video)
             else:
                 media_id = post_instagram(s, acc, video, text, self.link_for)
+                if collab_list(acc):
+                    self.accept_collabs_later(s, acc, cr, p, media_id)
             self.store.x("UPDATE reposts SET status='posted', posted_at=?, error=NULL, ig_media_id=?, caption_out=? "
                          "WHERE id=?", (now(), media_id, text, row["id"]))
             where = " (in TikTok drafts)" if platform == "tiktok" and s["tiktok_mode"] == "inbox" else ""
