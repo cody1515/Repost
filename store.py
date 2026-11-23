@@ -94,7 +94,8 @@ class Store:
         cols = self._columns("accounts")
         for col, typ in (("platform", "TEXT DEFAULT 'instagram'"), ("refresh_token", "TEXT"),
                          ("token_expires", "REAL DEFAULT 0"), ("open_id", "TEXT"),
-                         ("zernio_id", "TEXT"), ("tt_settings", "TEXT"), ("collab", "TEXT")):
+                         ("zernio_id", "TEXT"), ("tt_settings", "TEXT"), ("collab", "TEXT"),
+                         ("white_bg", "INTEGER DEFAULT 0")):
             if col not in cols:
                 self.x(f"ALTER TABLE accounts ADD COLUMN {col} {typ}")
         ccols = self._columns("creators")

@@ -764,6 +764,23 @@ class Engine:
                    or (r["status"] == "failed" and r["attempts"] < MAX_ATTEMPTS)]
         return random.choice(options) if options else None
 
+    def white_bg_edit(self, acc, cr, video, original, platform, work):
+        """White background + auto caption on top (clip_editor.py). On any error, posts the original."""
+        try:
+            import clip_editor
+            handle = (cr.get(platform) or cr.get(cr["pull_from"]) or "").lstrip("@").strip()
+            # use their caption's first line, minus hashtags/mentions, as the title for the top caption
+            title = (original or "").strip().splitlines()[0] if (original or "").strip() else ""
+            title = re.sub(r"[#@]\S+", "", title).strip()
+            out = work / "white.mp4"
+            top = clip_editor.edit_clip(str(video), str(out), clip_title=title, streamer=handle)
+            if out.exists() and out.stat().st_size > 0:
+                self.store.log("info", f"{acc['name']}: white background edit done (\"{top[:60]}\")")
+                return out
+        except Exception as e:
+            self.store.log("warn", f"{acc['name']}: white background edit failed, posting the original ({short(e)})")
+        return video
+
     def post_video(self, s, acc, cr, p):
         """p is a fetched post dict or an existing reposts row.
         Returns True if it posted, "skip" if it isn't a video, False if posting failed."""
@@ -785,6 +802,8 @@ class Engine:
                 return "skip"
             video = prepare_video(path, work)
             platform = acc.get("platform") or "instagram"
+            if acc.get("white_bg"):
+                video = self.white_bg_edit(acc, cr, video, caption, platform, work)
             text = build_caption(s, cr, caption, p["url"], platform)
             if platform == "tiktok" and acc.get("zernio_id"):
                 media_id = post_tiktok_zernio(acc, video, text)
