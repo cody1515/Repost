@@ -128,7 +128,7 @@ def twitch_ready():
     return bool(os.environ.get("TWITCH_CLIENT_ID") and os.environ.get("TWITCH_CLIENT_SECRET"))
 
 
-def _twitch_get(path, params):
+def _twitch_get(path, params, full=False):
     if not twitch_ready():
         raise RuntimeError("add TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET in Railway Variables")
     cid = os.environ["TWITCH_CLIENT_ID"]
@@ -147,20 +147,53 @@ def _twitch_get(path, params):
             _twitch_token["value"] = ""  # token expired early; get a new one and retry once
             continue
         check(r)
-        return r.json().get("data", [])
+        return r.json() if full else r.json().get("data", [])
 
 
-def fetch_twitch(handle, limit):
-    """Their top clips from the last TWITCH_CLIP_DAYS days (default 7), most-viewed first."""
+def twitch_find_games(text):
+    """'Grand Theft Auto VI, just chatting' -> [{"id": ..., "name": "Grand Theft Auto VI"}, ...]
+    Names must match a real Twitch category; if one doesn't, the error suggests the closest ones."""
+    out = []
+    for want in [x.strip() for x in re.split(r"[,\n]+", text or "") if x.strip()]:
+        hit = _twitch_get("/games", {"name": want})
+        if not hit:  # not an exact name: look for the right spelling
+            found = _twitch_get("/search/categories", {"query": want, "first": 5})
+            exact = [g for g in found if g["name"].lower() == want.lower()]
+            if exact:
+                hit = exact
+            else:
+                tips = ", ".join(f'"{g["name"]}"' for g in found[:4])
+                raise ValueError(f'No Twitch game called "{want}".' + (f" Did you mean {tips}?" if tips else ""))
+        g = {"id": hit[0]["id"], "name": hit[0]["name"]}
+        if g["id"] not in (x["id"] for x in out):
+            out.append(g)
+    return out
+
+
+def fetch_twitch(handle, limit, game_ids=None):
+    """Their top clips from the last TWITCH_CLIP_DAYS days (default 7), most-viewed first.
+    With game_ids, only clips from those games (checks up to 500 clips to find enough)."""
     users = _twitch_get("/users", {"login": handle.lower()})
     if not users:
         raise RuntimeError(f"no Twitch channel called {handle}")
     days = int(os.environ.get("TWITCH_CLIP_DAYS", "7") or 7)
     since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400))
-    clips = _twitch_get("/clips", {"broadcaster_id": users[0]["id"], "started_at": since,
-                                   "first": min(max(limit * 2, 20), 100)})
+    want = max(limit, 20)
+    params = {"broadcaster_id": users[0]["id"], "started_at": since, "first": 100}
+    clips, pages = [], 0
+    while pages < (5 if game_ids else 1):
+        res = _twitch_get("/clips", params, full=True)
+        pages += 1
+        batch = res.get("data", [])
+        clips += [c for c in batch if not game_ids or c.get("game_id") in game_ids]
+        cursor = (res.get("pagination") or {}).get("cursor")
+        if len(clips) >= want or not cursor or not batch:
+            break
+        params = dict(params, after=cursor)
+    if game_ids and not clips:
+        raise RuntimeError(f"no clips from the chosen game(s) in the last {days} days")
     clips.sort(key=lambda c: c.get("view_count", 0), reverse=True)
-    for c in clips[:max(limit, 20)]:
+    for c in clips[:want]:
         yield {"source": "twitch", "post_id": c["id"], "url": f"https://clips.twitch.tv/{c['id']}",
                "caption": c.get("title") or "", "views": c.get("view_count", 0)}
 
@@ -829,7 +862,8 @@ class Engine:
             if src == "tiktok":
                 posts = list(fetch_tiktok(handle, s["scan_depth"]))
             elif src == "twitch":
-                posts = list(fetch_twitch(handle, s["scan_depth"]))
+                games = [g["id"] for g in json.loads(cr.get("games") or "[]")]
+                posts = list(fetch_twitch(handle, s["scan_depth"], set(games) or None))
             else:
                 posts = self.load_instagram(s, acc, handle)
         except Exception as e:
