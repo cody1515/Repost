@@ -579,10 +579,26 @@ def account_username(version, acc):
 # --------------------------------------------------------------------------- #
 # Captions
 # --------------------------------------------------------------------------- #
+def clean_tags(text):
+    """'speed, #ishowspeed @speedclips' -> '#speed #ishowspeed @speedclips'"""
+    out = []
+    for t in re.split(r"[\s,]+", text or ""):
+        t = t.strip()
+        if not t or t in ("#", "@"):
+            continue
+        t = t if t[0] in "#@" else "#" + t
+        if t.lower() not in (x.lower() for x in out):
+            out.append(t)
+    return " ".join(out)
+
+
 def build_caption(s, creator, original, url, platform="instagram"):
     """Credit uses the creator's handle on the app you're posting to, if you have it."""
     handle = (creator.get(platform) or creator.get(creator["pull_from"]) or "").lstrip("@").strip()
-    credit = s["credit_format"].replace("{handle}", handle)
+    at = s["credit_format"].replace("{handle}", handle) if handle else ""
+    tags = clean_tags(creator.get("tags"))
+    style = creator.get("credit_style") or "at"
+    credit = {"at": at, "tags": tags, "both": f"{at} {tags}"}.get(style, at).strip() or at or tags
     tmpl = s["caption_template"]
 
     def fill(cap):
