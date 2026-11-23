@@ -99,7 +99,7 @@ class Store:
             if col not in cols:
                 self.x(f"ALTER TABLE accounts ADD COLUMN {col} {typ}")
         ccols = self._columns("creators")
-        for col, typ in (("last_error", "TEXT"), ("checked_at", "TEXT")):
+        for col, typ in (("last_error", "TEXT"), ("checked_at", "TEXT"), ("twitch", "TEXT")):
             if col not in ccols:
                 self.x(f"ALTER TABLE creators ADD COLUMN {col} {typ}")
         rcols = self._columns("reposts")

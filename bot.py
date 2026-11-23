@@ -86,7 +86,12 @@ def parse_link(url):
         if not m:
             raise ValueError("That Instagram link doesn't point to a post or reel")
         return "instagram", m.group(1), f"https://www.instagram.com/reel/{m.group(1)}/"
-    raise ValueError("Paste a TikTok or Instagram link")
+    if "twitch.tv" in host:
+        m = re.search(r"clips\.twitch\.tv/(?:embed\?clip=)?([A-Za-z0-9_-]+)", url) or re.search(r"/clip/([A-Za-z0-9_-]+)", url)
+        if not m:
+            raise ValueError("That Twitch link isn't a clip (it should have /clip/ in it)")
+        return "twitch", m.group(1), f"https://clips.twitch.tv/{m.group(1)}"
+    raise ValueError("Paste a TikTok, Instagram or Twitch clip link")
 
 
 # --------------------------------------------------------------------------- #
@@ -113,6 +118,63 @@ def download_tiktok(url, dest):
     if not found:
         raise RuntimeError("download finished but the file is missing")
     return found[0], info.get("description") or ""
+
+
+# ---- Twitch: a streamer's most-viewed recent clips (needs TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET) ----
+_twitch_token = {"value": "", "expires": 0.0}
+
+
+def twitch_ready():
+    return bool(os.environ.get("TWITCH_CLIENT_ID") and os.environ.get("TWITCH_CLIENT_SECRET"))
+
+
+def _twitch_get(path, params):
+    if not twitch_ready():
+        raise RuntimeError("add TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET in Railway Variables")
+    cid = os.environ["TWITCH_CLIENT_ID"]
+    for attempt in range(2):
+        if not _twitch_token["value"] or time.time() > _twitch_token["expires"] - 300:
+            r = requests.post("https://id.twitch.tv/oauth2/token", timeout=30, data={
+                "client_id": cid, "client_secret": os.environ["TWITCH_CLIENT_SECRET"],
+                "grant_type": "client_credentials"})
+            if r.status_code >= 400:
+                raise RuntimeError("Twitch rejected the client ID/secret; check them in Railway Variables")
+            d = r.json()
+            _twitch_token.update(value=d["access_token"], expires=time.time() + d.get("expires_in", 3600))
+        r = requests.get("https://api.twitch.tv/helix" + path, params=params, timeout=30,
+                         headers={"Client-Id": cid, "Authorization": "Bearer " + _twitch_token["value"]})
+        if r.status_code == 401 and attempt == 0:
+            _twitch_token["value"] = ""  # token expired early; get a new one and retry once
+            continue
+        check(r)
+        return r.json().get("data", [])
+
+
+def fetch_twitch(handle, limit):
+    """Their top clips from the last TWITCH_CLIP_DAYS days (default 7), most-viewed first."""
+    users = _twitch_get("/users", {"login": handle.lower()})
+    if not users:
+        raise RuntimeError(f"no Twitch channel called {handle}")
+    days = int(os.environ.get("TWITCH_CLIP_DAYS", "7") or 7)
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400))
+    clips = _twitch_get("/clips", {"broadcaster_id": users[0]["id"], "started_at": since,
+                                   "first": min(max(limit * 2, 20), 100)})
+    clips.sort(key=lambda c: c.get("view_count", 0), reverse=True)
+    for c in clips[:max(limit, 20)]:
+        yield {"source": "twitch", "post_id": c["id"], "url": f"https://clips.twitch.tv/{c['id']}",
+               "caption": c.get("title") or "", "views": c.get("view_count", 0)}
+
+
+def download_twitch(url, dest):
+    import yt_dlp
+    opts = {"quiet": True, "no_warnings": True, "outtmpl": str(dest / "video.%(ext)s"),
+            "format": "best[ext=mp4]/best"}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+    found = sorted(dest.glob("video.*"))
+    if not found:
+        raise RuntimeError("download finished but the file is missing")
+    return found[0], info.get("title") or ""
 
 
 def make_ig_loader(s):
@@ -750,6 +812,8 @@ class Engine:
         try:
             if src == "tiktok":
                 posts = list(fetch_tiktok(handle, s["scan_depth"]))
+            elif src == "twitch":
+                posts = list(fetch_twitch(handle, s["scan_depth"]))
             else:
                 posts = self.load_instagram(s, acc, handle)
         except Exception as e:
@@ -762,7 +826,11 @@ class Engine:
         options = [p for p in posts
                    if (r := done.get((p["source"], p["post_id"]))) is None
                    or (r["status"] == "failed" and r["attempts"] < MAX_ATTEMPTS)]
-        return random.choice(options) if options else None
+        if not options:
+            return None
+        if src == "twitch":  # clips come sorted by views: post the most-viewed one not posted yet
+            return options[0]
+        return random.choice(options)
 
     def white_bg_edit(self, acc, cr, video, original, platform, work):
         """White background + auto caption on top (clip_editor.py). On any error, posts the original."""
@@ -793,6 +861,8 @@ class Engine:
         try:
             if p["source"] == "tiktok":
                 path, caption = download_tiktok(p["url"], work)
+            elif p["source"] == "twitch":
+                path, caption = download_twitch(p["url"], work)
             else:
                 path, caption = self.download_ig(s, acc, cr, p, work)
             if not has_video(path):
