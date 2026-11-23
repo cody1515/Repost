@@ -754,7 +754,9 @@ class Engine:
                 posts = self.load_instagram(s, acc, handle)
         except Exception as e:
             self.store.log("warn", f"Couldn't load @{handle}'s {src}: {short(e)}")
+            self.store.x("UPDATE creators SET last_error=?, checked_at=? WHERE id=?", (short(e), now(), cr["id"]))
             return None
+        self.store.x("UPDATE creators SET last_error=NULL, checked_at=? WHERE id=?", (now(), cr["id"]))
         done = {(r["source"], r["post_id"]): r for r in self.store.q(
             "SELECT source, post_id, status, attempts FROM reposts WHERE account_id=?", (acc["id"],))}
         options = [p for p in posts
