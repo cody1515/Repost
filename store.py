@@ -94,9 +94,13 @@ class Store:
         cols = self._columns("accounts")
         for col, typ in (("platform", "TEXT DEFAULT 'instagram'"), ("refresh_token", "TEXT"),
                          ("token_expires", "REAL DEFAULT 0"), ("open_id", "TEXT"),
-                         ("zernio_id", "TEXT"), ("tt_settings", "TEXT")):
+                         ("zernio_id", "TEXT"), ("tt_settings", "TEXT"), ("collab", "TEXT")):
             if col not in cols:
                 self.x(f"ALTER TABLE accounts ADD COLUMN {col} {typ}")
+        ccols = self._columns("creators")
+        for col, typ in (("last_error", "TEXT"), ("checked_at", "TEXT")):
+            if col not in ccols:
+                self.x(f"ALTER TABLE creators ADD COLUMN {col} {typ}")
         rcols = self._columns("reposts")
         for col, typ in (("caption_out", "TEXT"), ("file", "TEXT"), ("duration", "REAL")):
             if col not in rcols:
