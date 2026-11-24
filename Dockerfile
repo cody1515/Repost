@@ -6,5 +6,5 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 ENV DATA_DIR=/data PYTHONUNBUFFERED=1
-# yt-dlp updates often to keep up with TikTok/Instagram changes; grab the latest on each start
-CMD ["sh", "-c", "pip install -q -U yt-dlp || true; python app.py"]
+# yt-dlp updates often to keep up with TikTok/Instagram changes; grab the newest build (incl. nightly fixes) on each start
+CMD ["sh", "-c", "pip install -q -U --pre 'yt-dlp[default]' || pip install -q -U yt-dlp || true; python app.py"]

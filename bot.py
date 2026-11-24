@@ -105,6 +105,8 @@ def fetch_tiktok(handle, limit):
         info = ydl.extract_info(f"https://www.tiktok.com/@{handle}", download=False)
     for e in (info.get("entries") or [])[:limit]:
         vid = str(e["id"])
+        if "/photo/" in (e.get("url") or "") or "/photo/" in (e.get("webpage_url") or ""):
+            continue  # photo slideshow, not a video
         yield {"source": "tiktok", "post_id": vid, "url": f"https://www.tiktok.com/@{handle}/video/{vid}"}
 
 
@@ -713,6 +715,7 @@ class Engine:
     # ---- one posting slot ----
     def fire(self, s, acc, why):
         self.status = f"Posting to {acc['name']}"
+        self.tried_now = set()  # videos already tried during this posting time
         if acc.get("zernio_id") and not tt_settings(acc)["auto_consent"]:
             self.store.log("warn", f"{acc['name']}: auto-posting is off, so nothing was posted (Accounts → Edit)")
             return False
@@ -821,14 +824,14 @@ class Engine:
             return download_url(p["video_url"], work), p.get("caption", "")
         # a link you pasted: find it in the creator's recent videos via the official API
         handle = (cr.get("instagram") or "").lstrip("@").strip()
-        reader = self.ig_reader(acc)
-        if handle and reader:
+        for reader in (self.ig_readers(acc) if handle else []):
             try:
                 for m in business_discovery(s, reader, handle, 50):
                     if m["post_id"] == p["post_id"]:
                         return download_url(m["video_url"], work), m["caption"]
+                break  # read fine, the post just isn't in their recent videos
             except Exception:
-                pass
+                continue
         return download_instagram(make_ig_loader(s), p["post_id"], work)
 
     def ig_reader(self, acc):
@@ -840,14 +843,25 @@ class Engine:
                 return a
         return None
 
+    def ig_readers(self, acc):
+        """Your connected Instagram accounts that can read others, the posting account first."""
+        out = [a for a in [acc] + self.store.accounts()
+               if a.get("platform", "instagram") == "instagram" and a.get("ig_user_id") and a.get("access_token")]
+        seen, uniq = set(), []
+        for a in out:
+            if a["id"] not in seen:
+                seen.add(a["id"]); uniq.append(a)
+        return uniq
+
     def load_instagram(self, s, acc, handle):
-        reader = self.ig_reader(acc)
         first = None
-        if reader:
+        for reader in self.ig_readers(acc):
             try:
                 return business_discovery(s, reader, handle, s["scan_depth"])
             except Exception as e:
-                first = e
+                first = first or e
+                if "isn't a public business" in str(e):
+                    break  # the creator's account is the problem, not the reader
         try:  # fallback: old method (often blocked on servers)
             return list(fetch_instagram(make_ig_loader(s), handle, s["scan_depth"]))
         except Exception:
@@ -873,9 +887,11 @@ class Engine:
         self.store.x("UPDATE creators SET last_error=NULL, checked_at=? WHERE id=?", (now(), cr["id"]))
         done = {(r["source"], r["post_id"]): r for r in self.store.q(
             "SELECT source, post_id, status, attempts FROM reposts WHERE account_id=?", (acc["id"],))}
+        tried = getattr(self, "tried_now", set())
         options = [p for p in posts
-                   if (r := done.get((p["source"], p["post_id"]))) is None
-                   or (r["status"] == "failed" and r["attempts"] < MAX_ATTEMPTS)]
+                   if (p["source"], p["post_id"]) not in tried
+                   and ((r := done.get((p["source"], p["post_id"]))) is None
+                        or (r["status"] == "failed" and r["attempts"] < MAX_ATTEMPTS))]
         if not options:
             return None
         if src == "twitch":  # clips come sorted by views: post the most-viewed one not posted yet
@@ -902,6 +918,8 @@ class Engine:
     def post_video(self, s, acc, cr, p):
         """p is a fetched post dict or an existing reposts row.
         Returns True if it posted, "skip" if it isn't a video, False if posting failed."""
+        if hasattr(self, "tried_now"):
+            self.tried_now.add((p["source"], p["post_id"]))
         self.store.x("INSERT OR IGNORE INTO reposts(account_id, creator_id, source, post_id, url, status, created_at)"
                      " VALUES (?,?,?,?,?,?,?)",
                      (acc["id"], cr["id"], p["source"], p["post_id"], p["url"], "posting", now()))
@@ -951,6 +969,14 @@ class Engine:
             self.store.log("info", f"{acc['name']}: posted {cr['name']}'s video{where}")
             return True
         except Exception as e:
+            if p["source"] == "tiktok" and "No video formats found" in str(e):
+                attempts = (row["attempts"] or 0) + 1
+                self.store.x("UPDATE reposts SET status='failed', attempts=?, error=? WHERE id=?",
+                             (attempts, "TikTok didn't give a video file (photo post, or TikTok blocked the download)",
+                              row["id"]))
+                self.store.log("warn", f"{acc['name']}: TikTok wouldn't give a video file for one of {cr['name']}'s "
+                                       "posts; trying another")
+                return "skip"
             attempts = (row["attempts"] or 0) + 1
             self.store.x("UPDATE reposts SET status='failed', attempts=?, error=? WHERE id=?",
                          (attempts, short(e), row["id"]))
